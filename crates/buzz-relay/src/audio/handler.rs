@@ -656,6 +656,9 @@ pub(crate) async fn handle_active_audio_connection(
 
     if let Some(shadow) = control.nip_fi_shadow() {
         shadow.observe_pairing(pubkey);
+        shadow
+            .observe_owner(&state, tenant.community(), pubkey)
+            .await;
     }
     // NIP-FI key pairing [FI-INV-05]: unconditional, using the shared production
     // seam. When an assertion was presented at upgrade, the proven NIP-42 key
@@ -7362,6 +7365,97 @@ mod tests {
                     session.expire();
                 });
                 assert!(records.is_empty(), "{refusal}: {records:?}");
+            }
+        }
+
+        // Audio judges an agent assertion by its token owner where enforce
+        // does: a banned token owner or a stored owner other than the token
+        // owner records `owner/denied`; a clean owner records nothing before
+        // the channel refusal that ends this join. Mutation: deleting audio's
+        // `observe_owner` call records nothing for every case.
+        #[test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        fn shadow_audio_auth_records_token_owner_refusals() {
+            use crate::nip_fi_shadow_session::tests::{
+                owned_assertion, shadow_records, shadow_state,
+            };
+            #[derive(Clone, Copy, Debug)]
+            enum Case {
+                CleanOwner,
+                BannedOwner,
+                OtherStoredOwner,
+            }
+            let cases: [(Case, &[&str]); 3] = [
+                (Case::CleanOwner, &[]),
+                (Case::BannedOwner, &["owner/denied"]),
+                (Case::OtherStoredOwner, &["owner/denied"]),
+            ];
+            for (case, expected) in cases {
+                let records = shadow_records(async move {
+                    let mut state = (*audio_test_state_real_db()
+                        .await
+                        .expect("postgres-ci provides a database"))
+                    .clone();
+                    state.nip_fi_deny_map = shadow_state(None).await.nip_fi_deny_map;
+                    state.nip_fi_shadow_sessions = std::sync::Arc::default();
+                    let state = std::sync::Arc::new(state);
+                    let id = uuid::Uuid::new_v4();
+                    sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                        .bind(id)
+                        .bind(format!("audio-owner-{}.example", id.simple()))
+                        .execute(state.db.pool())
+                        .await
+                        .expect("insert community");
+                    let community = buzz_core::tenant::CommunityId::from_uuid(id);
+                    let (agent, owner) = (nostr::Keys::generate(), nostr::Keys::generate());
+                    let owner_bytes = owner.public_key().to_bytes();
+                    match case {
+                        Case::BannedOwner => {
+                            state
+                                .db
+                                .ban_community_member(
+                                    community,
+                                    &owner_bytes,
+                                    &owner_bytes,
+                                    None,
+                                    None,
+                                )
+                                .await
+                                .expect("ban owner");
+                        }
+                        Case::OtherStoredOwner => {
+                            let prior = nostr::Keys::generate().public_key();
+                            for key in [agent.public_key(), prior] {
+                                state
+                                    .db
+                                    .ensure_user(community, key.as_bytes())
+                                    .await
+                                    .expect("ensure user");
+                            }
+                            assert!(state
+                                .db
+                                .set_agent_owner(
+                                    community,
+                                    agent.public_key().as_bytes(),
+                                    prior.as_bytes()
+                                )
+                                .await
+                                .expect("seed stored owner"));
+                        }
+                        Case::CleanOwner => {}
+                    }
+                    let session = crate::nip_fi_shadow_session::ShadowSession::start(
+                        &state,
+                        "audio",
+                        crate::nip_fi_shadow::BOUND.into(),
+                        owned_assertion(agent.public_key(), owner.public_key()),
+                        chrono::Utc::now(),
+                    );
+                    shadow_audio_auth_in(state, &agent, std::sync::Arc::clone(&session), community)
+                        .await;
+                    session.expire();
+                });
+                assert_eq!(records, expected, "{case:?}");
             }
         }
 

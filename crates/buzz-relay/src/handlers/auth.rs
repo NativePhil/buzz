@@ -75,32 +75,7 @@ pub(crate) async fn community_ban_outcome(
     token_owner: Option<nostr::PublicKey>,
     cached: bool,
 ) -> BanOutcome {
-    async fn lookup(
-        state: &AppState,
-        community: buzz_core::CommunityId,
-        key: &nostr::PublicKey,
-        cached: bool,
-    ) -> BanOutcome {
-        let restriction = if cached {
-            state
-                .restriction_state_cached(community, key.as_bytes())
-                .await
-        } else {
-            state
-                .db
-                .moderation_restriction_state(community, key.as_bytes())
-                .await
-        };
-        match restriction {
-            Ok(restriction) if restriction.banned => BanOutcome::Banned,
-            Ok(_) => BanOutcome::Clear,
-            Err(e) => {
-                warn!(pubkey = %key.to_hex(), error = %e, "ban-state DB lookup failed, denying (fail-closed)");
-                BanOutcome::DbError
-            }
-        }
-    }
-    let outcome = lookup(state, community, &pubkey, cached).await;
+    let outcome = principal_ban_outcome(state, community, &pubkey, cached).await;
     if outcome != BanOutcome::Clear {
         return outcome;
     }
@@ -114,9 +89,54 @@ pub(crate) async fn community_ban_outcome(
         )
     });
     match owner {
-        Some(owner) => lookup(state, community, &owner, cached).await,
+        Some(owner) => principal_ban_outcome(state, community, &owner, cached).await,
         None => BanOutcome::Clear,
     }
+}
+
+/// Ban verdict for one key, without any owner cascade.
+async fn principal_ban_outcome(
+    state: &AppState,
+    community: buzz_core::CommunityId,
+    key: &nostr::PublicKey,
+    cached: bool,
+) -> BanOutcome {
+    let restriction = if cached {
+        state
+            .restriction_state_cached(community, key.as_bytes())
+            .await
+    } else {
+        state
+            .db
+            .moderation_restriction_state(community, key.as_bytes())
+            .await
+    };
+    match restriction {
+        Ok(restriction) if restriction.banned => BanOutcome::Banned,
+        Ok(_) => BanOutcome::Clear,
+        Err(e) => {
+            warn!(pubkey = %key.to_hex(), error = %e, "ban-state DB lookup failed, denying (fail-closed)");
+            BanOutcome::DbError
+        }
+    }
+}
+
+/// Shadow only: the refusal enforce's token-owner rules would give `agent`,
+/// whose verified agent assertion names `owner`. Enforce bans the agent with
+/// its token owner and refuses a token owner other than the stored one.
+/// Reads only: nothing is linked or recorded on the socket.
+pub(crate) async fn token_owner_denial(
+    state: &AppState,
+    community: buzz_core::CommunityId,
+    agent: nostr::PublicKey,
+    owner: nostr::PublicKey,
+) -> Option<buzz_auth::DenialClass> {
+    let ban = principal_ban_outcome(state, community, &owner, false).await;
+    if let Some(denial) = ban_admission_denial(ban) {
+        return Some(denial.class);
+    }
+    let link = crate::api::relay_members::stored_owner_link(state, community, &agent, &owner).await;
+    owner_link_denial(link, true).map(|denial| denial.class)
 }
 
 fn ban_denial(outcome: BanOutcome) -> Option<(&'static str, &'static str, AuthOutcome)> {
@@ -413,6 +433,9 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             let shadow = conn.community_control.nip_fi_shadow();
             if let Some(shadow) = shadow {
                 shadow.observe_pairing(pubkey);
+                shadow
+                    .observe_owner(&state, conn.tenant.community(), pubkey)
+                    .await;
             }
             // NIP-FI key pairing [FI-INV-05]: immediately after successful
             // verify_auth_event, before community-ban/allowlist/membership gates.
@@ -1509,15 +1532,30 @@ mod tests {
         signer: &Keys,
         lifetime: chrono::Duration,
     ) -> (crate::connection::tests::TestConn, nostr::Event) {
+        let assertion = buzz_auth::VerifiedAssertion::for_test(
+            Some(asserted),
+            vec![chrono::Utc::now() + lifetime],
+        );
+        let nil = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil());
+        shadow_root_conn_with(state, nil, assertion, signer, None)
+    }
+
+    /// [`shadow_root_conn`] in `community` observing `assertion`, its AUTH
+    /// event carrying `auth_tag` when given.
+    pub(super) fn shadow_root_conn_with(
+        state: &crate::state::AppState,
+        community: buzz_core::tenant::CommunityId,
+        assertion: buzz_auth::VerifiedAssertion,
+        signer: &Keys,
+        auth_tag: Option<&str>,
+    ) -> (crate::connection::tests::TestConn, nostr::Event) {
         use chrono::Utc;
         let challenge = "shadow-root-challenge".to_owned();
         let pending = AuthState::Pending {
             challenge: challenge.clone(),
             started_at: Instant::now(),
         };
-        let t = crate::connection::tests::test_conn(pending, None);
-        let assertion =
-            buzz_auth::VerifiedAssertion::for_test(Some(asserted), vec![Utc::now() + lifetime]);
+        let t = crate::connection::tests::test_conn_in(pending, None, community);
         let session = crate::nip_fi_shadow_session::ShadowSession::start(
             state,
             "ws",
@@ -1526,11 +1564,14 @@ mod tests {
             Utc::now(),
         );
         t.conn.community_control.attach_nip_fi_shadow(Some(session));
-        let event = EventBuilder::new(Kind::Authentication, "")
+        let mut builder = EventBuilder::new(Kind::Authentication, "")
             .tag(Tag::parse(["relay", "ws://test.local"]).unwrap())
-            .tag(Tag::parse(["challenge", &challenge]).unwrap())
-            .sign_with_keys(signer)
-            .unwrap();
+            .tag(Tag::parse(["challenge", &challenge]).unwrap());
+        if let Some(tag) = auth_tag {
+            let fields: Vec<String> = serde_json::from_str(tag).unwrap();
+            builder = builder.tag(Tag::parse(fields).unwrap());
+        }
+        let event = builder.sign_with_keys(signer).unwrap();
         (t, event)
     }
 
@@ -1550,6 +1591,28 @@ mod tests {
             handle_auth(event, std::sync::Arc::clone(&t.conn), state).await;
         });
         assert_eq!(records, ["pairing/denied"]);
+    }
+
+    // A failed owner read records `owner` as unavailable, as enforce fails
+    // closed, and changes nothing else. The state's database is unreachable.
+    // Mutation: deleting root's `observe_owner` call loses the record.
+    #[test]
+    fn shadow_root_auth_records_unavailable_owner_read() {
+        use crate::nip_fi_shadow_session::tests::{owned_assertion, shadow_records, shadow_state};
+        let records = shadow_records(async {
+            let state = std::sync::Arc::new(shadow_state(None).await);
+            let agent = Keys::generate();
+            let nil = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil());
+            let (t, event) = shadow_root_conn_with(
+                &state,
+                nil,
+                owned_assertion(agent.public_key(), Keys::generate().public_key()),
+                &agent,
+                None,
+            );
+            handle_auth(event, std::sync::Arc::clone(&t.conn), state).await;
+        });
+        assert_eq!(records, ["owner/unavailable"]);
     }
 
     const HOUR: chrono::Duration = chrono::Duration::hours(1);
@@ -1653,6 +1716,98 @@ mod tests {
                 super::expire_shadow(&t);
             });
             assert!(records.is_empty(), "{records:?}");
+        }
+
+        /// Shadow judges an agent assertion by the owner enforce uses: the
+        /// token owner, even when the AUTH also carries a NIP-OA tag naming
+        /// another owner. A banned token owner or a stored owner other than
+        /// the token owner records `owner/denied`, while shadow still admits
+        /// as Off; a clean, matching owner records `admit/admit`.
+        /// Mutation: deleting root's `observe_owner` call records
+        /// `admit/admit` for every case.
+        #[test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        fn shadow_root_auth_records_token_owner_refusals() {
+            use crate::nip_fi_shadow_session::tests::{
+                owned_assertion, shadow_records, shadow_state,
+            };
+            #[derive(Clone, Copy, Debug)]
+            enum Case {
+                CleanOwner,
+                BannedOwner,
+                OtherStoredOwner,
+                BannedOwnerWithCleanNipOa,
+                NipOaOwnerStored,
+            }
+            for (case, expected) in [
+                (Case::CleanOwner, "admit/admit"),
+                (Case::BannedOwner, "owner/denied"),
+                (Case::OtherStoredOwner, "owner/denied"),
+                (Case::BannedOwnerWithCleanNipOa, "owner/denied"),
+                (Case::NipOaOwnerStored, "owner/denied"),
+            ] {
+                let mut ok_true = false;
+                let records = shadow_records(async {
+                    let mut state = (*auth_test_state_real_db_expect().await).clone();
+                    state.nip_fi_deny_map = shadow_state(None).await.nip_fi_deny_map;
+                    let state = std::sync::Arc::new(state);
+                    let (agent, owner, nip_oa) =
+                        (Keys::generate(), Keys::generate(), Keys::generate());
+                    let community = seeded_community(&state).await;
+                    let (mut t, event) = super::shadow_root_conn_with(
+                        &state,
+                        community,
+                        owned_assertion(agent.public_key(), owner.public_key()),
+                        &agent,
+                        matches!(
+                            case,
+                            Case::BannedOwnerWithCleanNipOa | Case::NipOaOwnerStored
+                        )
+                        .then(|| {
+                            buzz_sdk::nip_oa::compute_auth_tag(&nip_oa, &agent.public_key(), "")
+                                .unwrap()
+                        })
+                        .as_deref(),
+                    );
+                    let owner_bytes = owner.public_key().to_bytes();
+                    let stored = match case {
+                        Case::OtherStoredOwner => Some(Keys::generate().public_key()),
+                        Case::NipOaOwnerStored => Some(nip_oa.public_key()),
+                        _ => None,
+                    };
+                    if matches!(case, Case::BannedOwner | Case::BannedOwnerWithCleanNipOa) {
+                        state
+                            .db
+                            .ban_community_member(community, &owner_bytes, &owner_bytes, None, None)
+                            .await
+                            .expect("ban owner");
+                    }
+                    if let Some(stored) = stored {
+                        for key in [agent.public_key(), stored] {
+                            state
+                                .db
+                                .ensure_user(community, key.as_bytes())
+                                .await
+                                .expect("ensure user");
+                        }
+                        assert!(state
+                            .db
+                            .set_agent_owner(
+                                community,
+                                agent.public_key().as_bytes(),
+                                stored.as_bytes()
+                            )
+                            .await
+                            .expect("seed stored owner"));
+                    }
+                    handle_auth(event, std::sync::Arc::clone(&t.conn), state).await;
+                    while let Ok(WsMessage::Text(text)) = t.send_rx.try_recv() {
+                        ok_true |= is_ok_true(text.as_str());
+                    }
+                });
+                assert!(ok_true, "{case:?}: shadow admits as Off");
+                assert_eq!(records, [expected], "{case:?}");
+            }
         }
 
         /// A community whose row exists, so bans and users can reference it.

@@ -136,6 +136,24 @@ impl ShadowSession {
         }
     }
 
+    /// At enforce's token-owner checks: records the would-deny when an agent
+    /// assertion's owner is banned or differs from the agent's stored owner.
+    pub(crate) async fn observe_owner(
+        &self,
+        state: &AppState,
+        community: buzz_core::CommunityId,
+        pubkey: PublicKey,
+    ) {
+        let Some(owner) = self.assertion.owner() else {
+            return;
+        };
+        if let Some(class) =
+            crate::handlers::auth::token_owner_denial(state, community, pubkey, owner).await
+        {
+            self.decide(Err((Stage::Owner, class)));
+        }
+    }
+
     /// At enforce's post-registration deny-set check: registers the session,
     /// so a later deny marks it, then records the deny-set would-deny.
     pub(crate) fn observe_deny_set(self: &Arc<Self>, state: &AppState) {

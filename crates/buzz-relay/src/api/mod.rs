@@ -538,8 +538,33 @@ pub mod relay_members {
         Unavailable,
     }
 
+    /// Read-only twin of [`link_agent_owner`]'s conflict rule, for shadow
+    /// mode: the link it would return, writing nothing. Keep the two in step.
+    pub(crate) async fn stored_owner_link(
+        state: &AppState,
+        community: CommunityId,
+        agent: &nostr::PublicKey,
+        owner: &nostr::PublicKey,
+    ) -> OwnerLink {
+        match state
+            .db
+            .get_agent_channel_policy(community, agent.as_bytes())
+            .await
+        {
+            Ok(Some((_, Some(stored)))) if stored.as_slice() != owner.as_bytes() => {
+                OwnerLink::Conflict
+            }
+            Ok(_) => OwnerLink::Linked,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to read agent_owner_pubkey");
+                OwnerLink::Unavailable
+            }
+        }
+    }
+
     /// [`materialize_nip_oa_owner`], distinguishing a different stored owner
-    /// from a failed read or write.
+    /// from a failed read or write. Shadow mirrors its conflict rule in
+    /// [`stored_owner_link`].
     pub async fn link_agent_owner(
         state: &AppState,
         tenant: &TenantContext,
