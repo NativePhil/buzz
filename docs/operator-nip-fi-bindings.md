@@ -108,8 +108,10 @@ kgoose relies on this contract:
 - `issuers` is `[]` when `BUZZ_NIP_FI_PROVISION_BINDING` is unset, the host is
   not bindable, or nothing is bound. Only issuers in `BUZZ_NIP_FI_ISSUERS` are
   reported, in byte order.
-- `agent_assertions` is always present and mirrors
-  `BUZZ_NIP_FI_AGENT_ASSERTIONS`. kgoose refuses agent tokens when it is `false`.
+- `agent_assertions` is always present. It reports the relay-wide
+  agent-assertion setting, which is `true` only when
+  `BUZZ_NIP_FI_AGENT_ASSERTIONS` is on and the mode is `shadow` or `enforce`.
+  kgoose refuses agent assertion issuance when it is `false`.
 - 404 means no community has this host; 400 means the host is malformed.
 
 ## Rollout

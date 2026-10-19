@@ -2707,12 +2707,10 @@ mod postgres_tests {
         for enabled in [false, true] {
             let operator = Keys::generate();
             let (policy, _, host) = reserved_host_policy();
-            let Some(mut state) =
+            let mut state =
                 operator_test_state_with_policy(std::slice::from_ref(&operator), Some(policy))
                     .await
-            else {
-                return;
-            };
+                    .expect("Postgres test state must initialize");
             let state_mut = Arc::get_mut(&mut state).expect("unshared test state");
             Arc::make_mut(&mut state_mut.config).nip_fi.agent_assertions = enabled;
             state
