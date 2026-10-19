@@ -6442,8 +6442,9 @@ pub(crate) mod postgres_tests {
     /// one, a human token carrying one (valid or null), an agent token under
     /// an `at+jwt` policy and an unknown type are refused before any route.
     /// Every token carries valid `at+jwt` claims, so the `at+jwt` case is
-    /// refused only for its type. Mutations: accept `nip-fi-agent+jwt` under `at+jwt`, skip the owner
-    /// rule, or accept any `nip-fi*` type in `enforce_token_type` → RED.
+    /// refused only for its type. Mutations: accept `nip-fi-agent+jwt` under
+    /// `at+jwt`, skip the owner rule, or accept any `nip-fi*` type in
+    /// `enforce_token_type` → RED.
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn agent_token_type_binds_the_owner_claim_on_http() {
