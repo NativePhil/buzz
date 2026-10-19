@@ -305,6 +305,119 @@ pub(crate) mod test_support {
     pub(crate) const TEST_HOST: &str = "relay.example";
     pub(crate) const TEST_COMMUNITY_URI: &str = "https://relay.example";
 
+    /// The issuer and key ID of [`assertion_signing_key`].
+    pub(crate) const TEST_ISSUER: &str = "https://issuer.example";
+    pub(crate) const TEST_KID: &str = "test-key-1";
+
+    /// Ephemeral signing material shared by the test signer and verifier.
+    /// Never persist a private key fixture in source or on disk.
+    pub(crate) fn assertion_signing_key(
+    ) -> &'static (jsonwebtoken::EncodingKey, jsonwebtoken::jwk::JwkSet) {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+        static KEY: std::sync::OnceLock<(jsonwebtoken::EncodingKey, jsonwebtoken::jwk::JwkSet)> =
+            std::sync::OnceLock::new();
+        KEY.get_or_init(|| {
+            let rng = ring::rand::SystemRandom::new();
+            let algorithm = &ECDSA_P256_SHA256_FIXED_SIGNING;
+            let der = EcdsaKeyPair::generate_pkcs8(algorithm, &rng).expect("generate test key");
+            let pair = EcdsaKeyPair::from_pkcs8(algorithm, der.as_ref(), &rng)
+                .expect("parse generated test key");
+            // P-256 public keys use uncompressed SEC1: 0x04 || x || y.
+            let public = pair.public_key().as_ref();
+            assert_eq!(public.len(), 65);
+            assert_eq!(public[0], 4);
+            let jwks = serde_json::from_value(serde_json::json!({
+                "keys": [{
+                    "kty": "EC", "crv": "P-256", "use": "sig", "alg": "ES256",
+                    "kid": TEST_KID,
+                    "x": URL_SAFE_NO_PAD.encode(&public[1..33]),
+                    "y": URL_SAFE_NO_PAD.encode(&public[33..65])
+                }]
+            }))
+            .expect("valid generated JWKS");
+            (jsonwebtoken::EncodingKey::from_ec_der(der.as_ref()), jwks)
+        })
+    }
+
+    /// The real verifier trusting [`assertion_signing_key`] for [`TEST_ISSUER`]
+    /// at [`TEST_COMMUNITY_URI`], under `token_class`.
+    pub(crate) fn assertion_verifier(
+        token_class: buzz_auth::TokenClass,
+    ) -> buzz_auth::FederatedAssertionVerifier<buzz_auth::StaticIssuerKeySource> {
+        use buzz_auth::{
+            AssertionKeySet, FederatedAssertionVerifier, FreshnessClass, IssuerPolicy,
+            IssuerRegistry, StaticIssuerKeySource,
+        };
+        use jsonwebtoken::Algorithm;
+
+        let jwks = assertion_signing_key().1.clone();
+        let hard_deadline = chrono::Utc::now() + chrono::Duration::seconds(3600);
+        let key_set = AssertionKeySet::new_for_test(TEST_ISSUER.to_owned(), 1, jwks, hard_deadline)
+            .expect("valid test key set");
+        let jwks_contract = buzz_auth::JwksSourceContract::new(
+            format!("{TEST_ISSUER}/.well-known/jwks.json"),
+            300,
+            3600,
+        )
+        .expect("valid jwks contract");
+        let policy = IssuerPolicy::new(
+            TEST_ISSUER.to_owned(),
+            vec![TEST_COMMUNITY_URI.to_owned()],
+            token_class,
+            FreshnessClass::OfflineJwt,
+            vec![Algorithm::ES256],
+            60,
+            3600,
+            None,
+            jwks_contract,
+        )
+        .expect("valid issuer policy");
+        let mut registry = IssuerRegistry::new();
+        registry.insert(policy);
+        FederatedAssertionVerifier::new(registry, StaticIssuerKeySource::new([key_set]))
+    }
+
+    /// An `at+jwt` token class whose resource-owner subjects carry
+    /// `sub_type: "user"`.
+    pub(crate) fn at_jwt_class() -> buzz_auth::TokenClass {
+        buzz_auth::TokenClass::AccessTokenAtJwt {
+            subject_class: buzz_auth::SubjectClassContract::new(
+                "sub_type".to_owned(),
+                vec!["user".to_owned()],
+                vec!["client".to_owned()],
+                buzz_auth::ClientSubjectPosture::Reject,
+            )
+            .expect("valid subject class"),
+        }
+    }
+
+    /// Sign an assertion with an explicit `typ` and raw `nostr_owner_pubkey`.
+    pub(crate) fn sign_assertion(
+        typ: &str,
+        pubkey_hex: &str,
+        owner: Option<serde_json::Value>,
+    ) -> String {
+        use jsonwebtoken::{Algorithm, Header};
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = serde_json::json!({
+            "iss": TEST_ISSUER,
+            "aud": TEST_COMMUNITY_URI,
+            "iat": now,
+            "exp": now + 600,
+            "sub": "test-subject",
+            "nostr_pubkey": pubkey_hex,
+        });
+        if let Some(owner) = owner {
+            claims[buzz_auth::NOSTR_OWNER_PUBKEY_CLAIM] = owner;
+        }
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(TEST_KID.to_owned());
+        header.typ = Some(typ.to_owned());
+        let key = &assertion_signing_key().0;
+        jsonwebtoken::encode(&header, &claims, key).expect("sign assertion")
+    }
+
     /// One community at [`TEST_COMMUNITY_URI`] authorizing `issuers`.
     pub(crate) fn communities_for(issuers: &[&str]) -> NipFiCommunities {
         NipFiCommunities::for_test(TEST_COMMUNITY_URI, issuers)

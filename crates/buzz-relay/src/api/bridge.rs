@@ -5408,39 +5408,10 @@ pub(crate) mod postgres_tests {
         Some(Arc::new(state))
     }
 
-    const HANDLER_TEST_ISSUER: &str = "https://issuer.example";
-    const HANDLER_TEST_AUDIENCE: &str = "https://relay.example";
-    const HANDLER_TEST_KID: &str = "test-key-1";
-
-    /// Ephemeral signing material shared by the test signer and verifier.
-    /// Never persist a private key fixture in source or on disk.
-    fn handler_test_key() -> &'static (jsonwebtoken::EncodingKey, jsonwebtoken::jwk::JwkSet) {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
-        static KEY: std::sync::OnceLock<(jsonwebtoken::EncodingKey, jsonwebtoken::jwk::JwkSet)> =
-            std::sync::OnceLock::new();
-        KEY.get_or_init(|| {
-            let rng = ring::rand::SystemRandom::new();
-            let algorithm = &ECDSA_P256_SHA256_FIXED_SIGNING;
-            let der = EcdsaKeyPair::generate_pkcs8(algorithm, &rng).expect("generate test key");
-            let pair = EcdsaKeyPair::from_pkcs8(algorithm, der.as_ref(), &rng)
-                .expect("parse generated test key");
-            // P-256 public keys use uncompressed SEC1: 0x04 || x || y.
-            let public = pair.public_key().as_ref();
-            assert_eq!(public.len(), 65);
-            assert_eq!(public[0], 4);
-            let jwks = serde_json::from_value(serde_json::json!({
-                "keys": [{
-                    "kty": "EC", "crv": "P-256", "use": "sig", "alg": "ES256",
-                    "kid": HANDLER_TEST_KID,
-                    "x": URL_SAFE_NO_PAD.encode(&public[1..33]),
-                    "y": URL_SAFE_NO_PAD.encode(&public[33..65])
-                }]
-            }))
-            .expect("valid generated JWKS");
-            (jsonwebtoken::EncodingKey::from_ec_der(der.as_ref()), jwks)
-        })
-    }
+    use crate::nip_fi_core::test_support::{
+        assertion_signing_key as handler_test_key, assertion_verifier as handler_test_verifier_for,
+        sign_assertion as sign_typed_assertion, TEST_ISSUER as HANDLER_TEST_ISSUER,
+    };
 
     /// Build a NIP-FI Enforce AppState with a real injected P-256 verifier.
     ///
@@ -5456,38 +5427,7 @@ pub(crate) mod postgres_tests {
     /// The real verifier trusting the shared HANDLER_TEST_* key material.
     fn handler_test_verifier(
     ) -> buzz_auth::FederatedAssertionVerifier<buzz_auth::StaticIssuerKeySource> {
-        use buzz_auth::{
-            AssertionKeySet, FederatedAssertionVerifier, FreshnessClass, IssuerPolicy,
-            IssuerRegistry, StaticIssuerKeySource, TokenClass,
-        };
-        use jsonwebtoken::Algorithm;
-
-        let jwks = handler_test_key().1.clone();
-        let hard_deadline = chrono::Utc::now() + chrono::Duration::seconds(3600);
-        let key_set =
-            AssertionKeySet::new_for_test(HANDLER_TEST_ISSUER.to_owned(), 1, jwks, hard_deadline)
-                .expect("valid test key set");
-        let jwks_contract = buzz_auth::JwksSourceContract::new(
-            format!("{HANDLER_TEST_ISSUER}/.well-known/jwks.json"),
-            300,
-            3600,
-        )
-        .expect("valid jwks contract");
-        let policy = IssuerPolicy::new(
-            HANDLER_TEST_ISSUER.to_owned(),
-            vec![HANDLER_TEST_AUDIENCE.to_owned()],
-            TokenClass::DedicatedNipFi,
-            FreshnessClass::OfflineJwt,
-            vec![Algorithm::ES256],
-            60,
-            3600,
-            None,
-            jwks_contract,
-        )
-        .expect("valid issuer policy");
-        let mut registry = IssuerRegistry::new();
-        registry.insert(policy);
-        FederatedAssertionVerifier::new(registry, StaticIssuerKeySource::new([key_set]))
+        handler_test_verifier_for(buzz_auth::TokenClass::DedicatedNipFi)
     }
 
     /// Mint a signed NIP-FI assertion whose `nostr_pubkey` = `pubkey_hex`,
@@ -5505,24 +5445,12 @@ pub(crate) mod postgres_tests {
     }
 
     fn sign_test_assertion(pubkey_hex: &str, owner_hex: Option<&str>) -> String {
-        use jsonwebtoken::{Algorithm, Header};
-        let now = chrono::Utc::now().timestamp();
-        let mut claims = serde_json::json!({
-            "iss": HANDLER_TEST_ISSUER,
-            "aud": HANDLER_TEST_AUDIENCE,
-            "iat": now,
-            "exp": now + 600,
-            "sub": "test-subject",
-            "nostr_pubkey": pubkey_hex,
-        });
-        if let Some(owner_hex) = owner_hex {
-            claims[buzz_auth::NOSTR_OWNER_PUBKEY_CLAIM] = owner_hex.into();
-        }
-        let mut header = Header::new(Algorithm::ES256);
-        header.kid = Some(HANDLER_TEST_KID.to_owned());
-        header.typ = Some("nip-fi+jwt".to_owned());
-        let key = &handler_test_key().0;
-        jsonwebtoken::encode(&header, &claims, key).expect("sign assertion")
+        let typ = if owner_hex.is_some() {
+            "nip-fi-agent+jwt"
+        } else {
+            "nip-fi+jwt"
+        };
+        sign_typed_assertion(typ, pubkey_hex, owner_hex.map(serde_json::Value::from))
     }
 
     /// Build a HeaderMap containing a valid NIP-98 Authorization header +
@@ -6509,6 +6437,94 @@ pub(crate) mod postgres_tests {
         buzz_v1_wire_contract("POST", "/buzz/v1/me/read-state", &body).await;
     }
 
+    /// HTTP admission binds `nostr_owner_pubkey` to the token type: an agent
+    /// token with a valid owner is admitted, while an agent token without
+    /// one, a human token carrying one (valid or null), an agent token under
+    /// an `at+jwt` policy and an unknown type are refused before any route.
+    /// Mutations: accept `nip-fi-agent+jwt` under `at+jwt`, skip the owner
+    /// rule, or accept any `nip-fi*` type in `enforce_token_type` → RED.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn agent_token_type_binds_the_owner_claim_on_http() {
+        use axum::http::StatusCode;
+
+        let fixture = nip_fi_enforce_test_state().await.expect("local Postgres");
+        let (agent, owner) = (Keys::generate(), Keys::generate());
+        let (agent_hex, owner_hex) = (agent.public_key().to_hex(), owner.public_key().to_hex());
+        let dedicated = buzz_auth::TokenClass::DedicatedNipFi;
+        let access_token = crate::nip_fi_core::test_support::at_jwt_class;
+        let cases = [
+            (
+                "agent with owner",
+                dedicated.clone(),
+                "nip-fi-agent+jwt",
+                Some(owner_hex.clone().into()),
+                StatusCode::OK,
+            ),
+            (
+                "agent without owner",
+                dedicated.clone(),
+                "nip-fi-agent+jwt",
+                None,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "human with owner",
+                dedicated.clone(),
+                "nip-fi+jwt",
+                Some(owner_hex.clone().into()),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "human with null owner",
+                dedicated.clone(),
+                "nip-fi+jwt",
+                Some(serde_json::Value::Null),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "agent under at+jwt",
+                access_token(),
+                "nip-fi-agent+jwt",
+                Some(owner_hex.clone().into()),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "unknown type",
+                dedicated,
+                "nip-fi-agent",
+                Some(owner_hex.into()),
+                StatusCode::FORBIDDEN,
+            ),
+        ];
+        for (case, token_class, typ, owner_claim, expected) in cases {
+            let mut state = (*fixture).clone();
+            state.nip_fi_verifier = Some(Arc::new(handler_test_verifier_for(token_class)));
+            let state = Arc::new(state);
+            let host = format!("agent-typ-{}.local", uuid::Uuid::new_v4().simple());
+            state
+                .db
+                .ensure_configured_community(&host)
+                .await
+                .expect("ensure community");
+            let body = br#"[{"kinds":[1],"limit":1}]"#.as_slice();
+            let mut headers =
+                make_nip98_headers(&agent, &format!("https://{host}/query"), "POST", body);
+            headers.insert(
+                buzz_auth::CLIENT_ATTACHED_HEADER,
+                format!(
+                    "Bearer {}",
+                    sign_typed_assertion(typ, &agent_hex, owner_claim)
+                )
+                .parse()
+                .expect("assertion header"),
+            );
+            let (status, _, body) =
+                oneshot_request_full(state, "POST", "/query", &host, headers, body).await;
+            assert_eq!(status, expected, "{case}: {body:?}");
+        }
+    }
+
     /// The owner of an agent's verified token decides HTTP admission, and
     /// every refusal is NIP-FI's fixed denial on `/query` (bridge),
     /// `/buzz/v1/me/sidebar` and git `info/refs`: an owner other than the stored one, a banned
@@ -6527,9 +6543,7 @@ pub(crate) mod postgres_tests {
         let config = Arc::make_mut(&mut state.config);
         config.require_relay_membership = true;
         config.buzz_v1_enabled = true;
-        state.nip_fi_verifier = Some(Arc::new(
-            handler_test_verifier().with_agent_assertions(true),
-        ));
+        state.nip_fi_verifier = Some(Arc::new(handler_test_verifier()));
         let state = Arc::new(state);
 
         for case in ["admitted", "conflict", "banned", "link_failure"] {
@@ -6690,9 +6704,7 @@ pub(crate) mod postgres_tests {
                 let config = Arc::make_mut(&mut state.config);
                 config.require_relay_membership = true;
                 config.buzz_v1_enabled = true;
-                state.nip_fi_verifier = Some(Arc::new(
-                    handler_test_verifier().with_agent_assertions(true),
-                ));
+                state.nip_fi_verifier = Some(Arc::new(handler_test_verifier()));
                 let state = Arc::new(state);
                 let host = format!("ban-reread-{}.local", uuid::Uuid::new_v4().simple());
                 let community = state
@@ -6803,9 +6815,7 @@ pub(crate) mod postgres_tests {
                 // Enforce refuses a request without a token at admission.
                 config.nip_fi.mode = buzz_auth::NipFiMode::Off;
             }
-            state.nip_fi_verifier = Some(Arc::new(
-                handler_test_verifier().with_agent_assertions(true),
-            ));
+            state.nip_fi_verifier = Some(Arc::new(handler_test_verifier()));
             let state = Arc::new(state);
             let host = format!("publish-ban-{}.local", uuid::Uuid::new_v4().simple());
             let community = state

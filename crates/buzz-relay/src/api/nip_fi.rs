@@ -1945,7 +1945,6 @@ mod route_integration_tests {
             jwks_configs: jwks_configs.clone(),
             command_configs: cmd_configs.clone(),
             max_connection_lifetime_secs: 3600,
-            agent_assertions: false,
             communities: crate::nip_fi_core::test_support::any_host(TEST_AUD),
         };
 
@@ -3572,7 +3571,6 @@ mod route_integration_tests {
                 jwks_configs: vec![test_jwks_config()],
                 command_configs: command_configs.clone(),
                 max_connection_lifetime_secs: 3600,
-                agent_assertions: false,
                 communities: crate::nip_fi_core::test_support::any_host(TEST_AUD),
             };
             let pool = sqlx::PgPool::connect_lazy(&config.database_url).unwrap();

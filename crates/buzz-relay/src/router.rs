@@ -2172,7 +2172,6 @@ mod tests {
             registry: IssuerRegistry::new(),
             jwks_configs: vec![],
             max_connection_lifetime_secs: 3600,
-            agent_assertions: false,
             command_configs: Vec::new(),
             communities: crate::nip_fi_core::test_support::any_host("https://relay.example"),
         };
@@ -3962,7 +3961,6 @@ mod tests {
             command_configs: vec![],
             communities: crate::nip_fi_core::test_support::any_host(DENY_TEST_AUD),
             max_connection_lifetime_secs: 3600,
-            agent_assertions: false,
         };
 
         // 100ms acquire timeout: the port-1 stub must fail fast instead of

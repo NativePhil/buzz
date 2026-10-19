@@ -286,9 +286,6 @@ pub struct NipFiRelayConfig {
     /// Per-issuer S4 command entries: `(issuer_uri, CommandIssuerEnvConfig)`.
     /// Empty when mode is Off/DenyProtected.
     pub command_configs: Vec<(String, crate::api::nip_fi::CommandIssuerEnvConfig)>,
-    /// Admit agent assertions carrying `nostr_owner_pubkey` and advertise
-    /// `agent_assertions` (`BUZZ_NIP_FI_AGENT_ASSERTIONS`, default off).
-    pub agent_assertions: bool,
 }
 
 impl NipFiRelayConfig {
@@ -299,8 +296,6 @@ impl NipFiRelayConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         let mode = parse_mode()?;
         let source = parse_community_source()?;
-        let agent_assertions =
-            crate::config::parse_bool("BUZZ_NIP_FI_AGENT_ASSERTIONS", false)? && mode.evaluates();
         if source == CommunitySource::Database
             && !std::env::var("BUZZ_NIP_FI_COMMUNITIES")
                 .unwrap_or_default()
@@ -326,7 +321,6 @@ impl NipFiRelayConfig {
                 jwks_configs: Vec::new(),
                 max_connection_lifetime_secs: 0,
                 command_configs: Vec::new(),
-                agent_assertions,
             });
         }
 
@@ -521,7 +515,6 @@ impl NipFiRelayConfig {
             jwks_configs,
             max_connection_lifetime_secs,
             command_configs,
-            agent_assertions,
         })
     }
 }

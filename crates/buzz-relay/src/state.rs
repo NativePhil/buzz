@@ -2401,10 +2401,10 @@ fn build_nip_fi_components(config: &crate::config::Config) -> NipFiComponents {
             }
         };
 
-    let verifier: Arc<dyn buzz_auth::VerifyAssertion> = Arc::new(
-        FederatedAssertionVerifier::new(config.nip_fi.registry.clone(), Arc::clone(&source))
-            .with_agent_assertions(config.nip_fi.agent_assertions),
-    );
+    let verifier: Arc<dyn buzz_auth::VerifyAssertion> = Arc::new(FederatedAssertionVerifier::new(
+        config.nip_fi.registry.clone(),
+        Arc::clone(&source),
+    ));
 
     (Some(verifier), Some(source))
 }

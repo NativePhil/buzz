@@ -15,8 +15,8 @@
 //! Corrections applied to the mined #1476 verifier, per the settled spec:
 //!
 //! - **Token class + `typ` enforcement**: a policy selects exactly one class
-//!   before parsing claims; `at+jwt` and `nip-fi+jwt` `typ` values are enforced
-//!   exactly, and the long-form `application/at+jwt` is rejected.
+//!   before parsing claims; `at+jwt`, `nip-fi+jwt` and `nip-fi-agent+jwt`
+//!   `typ` values are enforced exactly, and the long-form `application/at+jwt` is rejected.
 //! - **ID-token denial**: OIDC ID tokens deny even when `iss`, `aud`, `sub`
 //!   match, via exact `typ` mismatch against every accepted class.
 //! - **Fixed `nostr_pubkey`**: accepted only as lowercase hex of exactly one
@@ -312,7 +312,6 @@ pub struct FederatedAssertionVerifier<S: IssuerKeySource> {
     registry: IssuerRegistry,
     key_source: S,
     transport_contract_id: TransportContractId,
-    agent_assertions: bool,
 }
 
 impl<S: IssuerKeySource> FederatedAssertionVerifier<S> {
@@ -323,17 +322,7 @@ impl<S: IssuerKeySource> FederatedAssertionVerifier<S> {
             registry,
             key_source,
             transport_contract_id: TransportContractId::core_client_attached(),
-            agent_assertions: false,
         }
-    }
-
-    /// Admit agent assertions (NIP-FI.md, "Agent keys"): a verified
-    /// `nostr_owner_pubkey` is sealed as the assertion's owner. Without this,
-    /// any token carrying the claim is rejected evidence.
-    #[must_use]
-    pub const fn with_agent_assertions(mut self, agent_assertions: bool) -> Self {
-        self.agent_assertions = agent_assertions;
-        self
     }
 
     /// Test shorthand: verify for a community whose expected `aud` is `aud`
@@ -403,7 +392,7 @@ impl<S: IssuerKeySource> FederatedAssertionVerifier<S> {
         if !policy.algorithms().contains(&header.algorithm) {
             return Err(VerifierError::UnsupportedAlgorithm);
         }
-        enforce_token_type(policy.token_class(), header.typ.as_deref())?;
+        let owner_rule = enforce_token_type(policy.token_class(), header.typ.as_deref())?;
 
         // Resolve the key snapshot internally from the trusted source, keyed by
         // the policy's exact `iss`. The snapshot is never a caller argument, so
@@ -451,7 +440,7 @@ impl<S: IssuerKeySource> FederatedAssertionVerifier<S> {
 
         let subject = claim_string(&claims, SUBJECT_CLAIM, MAX_SUBJECT_BYTES)?;
         let asserted_key = parse_nostr_pubkey_claim(&claims)?;
-        let owner = self.parse_owner_claim(&claims, asserted_key)?;
+        let owner = parse_owner_claim(owner_rule, &claims, asserted_key)?;
 
         let now = Utc::now();
         let deadlines = self.check_time_and_deadlines(policy, &key_set, &claims, now)?;
@@ -485,27 +474,6 @@ impl<S: IssuerKeySource> FederatedAssertionVerifier<S> {
                 token.to_owned(),
             ),
         ))
-    }
-
-    /// The optional `nostr_owner_pubkey` claim: absent is no owner; present is
-    /// rejected unless this relay admits agent assertions, and must then be a
-    /// canonical key distinct from the asserted key.
-    fn parse_owner_claim(
-        &self,
-        claims: &Map<String, Value>,
-        asserted_key: Option<PublicKey>,
-    ) -> Result<Option<PublicKey>, VerifierError> {
-        let Some(value) = claims.get(NOSTR_OWNER_PUBKEY_CLAIM) else {
-            return Ok(None);
-        };
-        if !self.agent_assertions {
-            return Err(VerifierError::ClaimRejected);
-        }
-        let owner = parse_lowercase_hex_key(value)?;
-        if Some(owner) == asserted_key {
-            return Err(VerifierError::ClaimRejected);
-        }
-        Ok(Some(owner))
     }
 
     fn unverified_issuer(&self, token: &str) -> Result<String, VerifierError> {
@@ -780,17 +748,48 @@ fn parse_algorithm(alg: &str) -> Result<Algorithm, VerifierError> {
     }
 }
 
-/// Enforce the policy's single token class against the header `typ`.
-fn enforce_token_type(class: &TokenClass, typ: Option<&str>) -> Result<(), VerifierError> {
-    match class {
-        TokenClass::AccessTokenAtJwt { .. } => match typ {
-            Some("at+jwt") => Ok(()),
-            _ => Err(VerifierError::TokenTypeRejected),
-        },
-        TokenClass::DedicatedNipFi => match typ {
-            Some("nip-fi+jwt") => Ok(()),
-            _ => Err(VerifierError::TokenTypeRejected),
-        },
+/// Whether an accepted token type must carry `nostr_owner_pubkey`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerRule {
+    /// `nip-fi-agent+jwt`: the owner claim is mandatory.
+    Required,
+    /// Every other accepted type: the owner claim must be absent.
+    Forbidden,
+}
+
+/// Enforce the policy's single token class against the header `typ`. The
+/// dedicated class has a human (`nip-fi+jwt`) and an agent
+/// (`nip-fi-agent+jwt`) type; `at+jwt` policies accept only `at+jwt`.
+fn enforce_token_type(class: &TokenClass, typ: Option<&str>) -> Result<OwnerRule, VerifierError> {
+    match (class, typ) {
+        (TokenClass::AccessTokenAtJwt { .. }, Some("at+jwt"))
+        | (TokenClass::DedicatedNipFi, Some("nip-fi+jwt")) => Ok(OwnerRule::Forbidden),
+        (TokenClass::DedicatedNipFi, Some("nip-fi-agent+jwt")) => Ok(OwnerRule::Required),
+        _ => Err(VerifierError::TokenTypeRejected),
+    }
+}
+
+/// The `nostr_owner_pubkey` claim, bound to the token type (NIP-FI.md, "Agent
+/// keys"): an agent token must carry a canonical owner key distinct from the
+/// asserted key; any other type carrying the claim, with any value, denies.
+fn parse_owner_claim(
+    rule: OwnerRule,
+    claims: &Map<String, Value>,
+    asserted_key: Option<PublicKey>,
+) -> Result<Option<PublicKey>, VerifierError> {
+    let value = claims.get(NOSTR_OWNER_PUBKEY_CLAIM);
+    match (rule, value) {
+        (OwnerRule::Forbidden, None) => Ok(None),
+        (OwnerRule::Required, None) | (OwnerRule::Forbidden, Some(_)) => {
+            Err(VerifierError::ClaimRejected)
+        }
+        (OwnerRule::Required, Some(value)) => {
+            let owner = parse_lowercase_hex_key(value)?;
+            if Some(owner) == asserted_key {
+                return Err(VerifierError::ClaimRejected);
+            }
+            Ok(Some(owner))
+        }
     }
 }
 
