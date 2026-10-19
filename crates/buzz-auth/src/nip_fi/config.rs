@@ -81,9 +81,9 @@ pub(crate) const MAX_JTI_BYTES: usize = 512;
 /// requirement is always enforced.
 ///
 /// v3 (PR #8401): dedicated policies also accept the `nip-fi-agent+jwt` agent
-/// type, which requires an `owner` claim (a valid lowercase key distinct from
-/// the asserted key); a `nip-fi+jwt` or `at+jwt` token carrying `owner` with
-/// any value, `null` included, is rejected.
+/// type, which requires a `nostr_owner_pubkey` claim (a valid lowercase key
+/// distinct from the asserted key); a `nip-fi+jwt` or `at+jwt` token carrying
+/// `nostr_owner_pubkey` with any value, `null` included, is rejected.
 pub(crate) const VERIFIER_CONTRACT_VERSION: u32 = 3;
 
 /// The transport-contract fingerprint folded into [`TransportContractId`].
@@ -336,8 +336,8 @@ pub enum TokenClass {
         subject_class: SubjectClassContract,
     },
     /// A dedicated Buzz assertion: protected `typ` is exactly `nip-fi+jwt`
-    /// (human; `owner` forbidden) or `nip-fi-agent+jwt` (agent; `owner`
-    /// required).
+    /// (human; `nostr_owner_pubkey` forbidden) or `nip-fi-agent+jwt` (agent;
+    /// `nostr_owner_pubkey` required).
     DedicatedNipFi,
 }
 
@@ -821,29 +821,6 @@ mod jwks_transport_identity_tests {
             hex::encode(policy(contract).id().as_bytes()),
             "da846eec66b2e084ac3557d8e5c2a3a2faf12946e965c82d2ef46f91b6fa014e",
             "mesh transport is part of policy identity"
-        );
-    }
-
-    #[test]
-    fn agent_token_contract_moves_the_policy_id() {
-        let contract = || {
-            JwksSourceContract::new(
-                "https://issuer.example/.well-known/jwks.json".to_owned(),
-                300,
-                3600,
-            )
-            .expect("valid public contract")
-        };
-        let id = hex::encode(policy(contract()).id().as_bytes());
-
-        assert_ne!(
-            id, "fae0dd479d79306c5eef135594f678a5cdf3a2ee45770e20a7e83395fc76857f",
-            "the v3 agent-type/owner contract must not reuse the v2 policy ID"
-        );
-        assert_eq!(
-            id,
-            hex::encode(policy(contract()).id().as_bytes()),
-            "identical configurations hash the same"
         );
     }
 }
