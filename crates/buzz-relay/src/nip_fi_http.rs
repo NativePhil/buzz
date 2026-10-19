@@ -442,7 +442,8 @@ async fn observe_shadow_verdict<D: HttpDenyMap>(
 }
 
 /// The token-owner refusal for `agent` in the request's tenant. A Host that
-/// binds no tenant is refused by the route itself, so it has none.
+/// binds no tenant is refused by the route itself, so it has none; a failed
+/// tenant read leaves the owner unchecked, so it is unavailable.
 async fn observe_owner(
     state: &crate::state::AppState,
     headers: &HeaderMap,
@@ -453,7 +454,13 @@ async fn observe_owner(
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let tenant = crate::tenant::bind_community(&state.db, host).await.ok()?;
+    let tenant = match crate::tenant::bind_community(&state.db, host).await {
+        Ok(tenant) => tenant,
+        Err(crate::tenant::BindError::UnmappedHost) => return None,
+        Err(crate::tenant::BindError::Lookup(_)) => {
+            return Some(DenialClass::AuthorizationUnavailable)
+        }
+    };
     crate::handlers::auth::token_owner_denial(state, tenant.community(), agent, owner).await
 }
 
@@ -1611,70 +1618,81 @@ mod tests {
         assert!(admission.is_ok(), "shadow admits");
     }
 
-    // Shadow judges an admitted agent assertion by its token owner, as
-    // `enforce_relay_membership` does after admission: a banned token owner
-    // or a stored owner other than the token owner records `owner/denied`,
-    // a clean owner `admit/admit`, and shadow admits each. Mutation: deleting
-    // the owner step in `observe_shadow_verdict` records `admit/admit` for
-    // every case.
-    #[test]
-    #[ignore = "requires Postgres"]
-    fn shadow_records_token_owner_refusals() {
-        #[derive(Clone, Copy, Debug)]
-        enum Case {
-            CleanOwner,
-            BannedOwner,
-            OtherStoredOwner,
-        }
-        for (case, expected) in [
-            (Case::CleanOwner, "admit/admit"),
-            (Case::BannedOwner, "owner/denied"),
-            (Case::OtherStoredOwner, "owner/denied"),
-        ] {
-            let records = crate::nip_fi_shadow_session::tests::shadow_records(async {
-                let state = crate::state::tests::test_state_with_database_url(
-                    &crate::test_support::database_url(),
-                )
-                .await;
-                let community = state
-                    .db
-                    .ensure_configured_community(crate::nip_fi_core::test_support::TEST_HOST)
-                    .await
-                    .expect("ensure community")
-                    .id;
-                let (agent, owner) = (any_pubkey(), any_pubkey());
-                match case {
-                    Case::BannedOwner => state
-                        .db
-                        .ban_community_member(
-                            community,
-                            &owner.to_bytes(),
-                            &owner.to_bytes(),
-                            None,
-                            None,
-                        )
-                        .await
-                        .expect("ban owner"),
-                    Case::OtherStoredOwner => {
-                        let prior = any_pubkey();
-                        for key in [agent, prior] {
-                            state
-                                .db
-                                .ensure_user(community, key.as_bytes())
-                                .await
-                                .expect("ensure user");
-                        }
-                        assert!(state
-                            .db
-                            .set_agent_owner(community, agent.as_bytes(), prior.as_bytes())
+    mod postgres_tests {
+        use super::*;
+
+        // Shadow judges an admitted agent assertion by its token owner, as
+        // `enforce_relay_membership` does after admission: a banned token owner
+        // or a stored owner other than the token owner records `owner/denied`,
+        // a clean owner `admit/admit`, and shadow admits each. A tenant read that
+        // fails before the owner is checked records `owner/unavailable`.
+        // Mutations: deleting the owner step in `observe_shadow_verdict` records
+        // `admit/admit` for every case; collapsing the read failure in
+        // `observe_owner` to `None` records `admit/admit` for `TenantReadFails`.
+        #[test]
+        #[ignore = "requires Postgres"]
+        fn shadow_records_token_owner_refusals() {
+            #[derive(Clone, Copy, Debug)]
+            enum Case {
+                CleanOwner,
+                BannedOwner,
+                OtherStoredOwner,
+                TenantReadFails,
+            }
+            for (case, expected) in [
+                (Case::CleanOwner, "admit/admit"),
+                (Case::BannedOwner, "owner/denied"),
+                (Case::OtherStoredOwner, "owner/denied"),
+                (Case::TenantReadFails, "owner/unavailable"),
+            ] {
+                let records = crate::nip_fi_shadow_session::tests::shadow_records(async {
+                    let state = crate::state::tests::test_state_with_database_pool(
+                        sqlx::PgPool::connect(&crate::test_support::database_url())
                             .await
-                            .expect("seed stored owner"));
+                            .expect("connect test database"),
+                    )
+                    .await;
+                    let community = state
+                        .db
+                        .ensure_configured_community(crate::nip_fi_core::test_support::TEST_HOST)
+                        .await
+                        .expect("ensure community")
+                        .id;
+                    let (agent, owner) = (any_pubkey(), any_pubkey());
+                    match case {
+                        Case::BannedOwner => state
+                            .db
+                            .ban_community_member(
+                                community,
+                                &owner.to_bytes(),
+                                &owner.to_bytes(),
+                                None,
+                                None,
+                            )
+                            .await
+                            .expect("ban owner"),
+                        Case::OtherStoredOwner => {
+                            let prior = any_pubkey();
+                            for key in [agent, prior] {
+                                state
+                                    .db
+                                    .ensure_user(community, key.as_bytes())
+                                    .await
+                                    .expect("ensure user");
+                            }
+                            assert!(state
+                                .db
+                                .set_agent_owner(community, agent.as_bytes(), prior.as_bytes())
+                                .await
+                                .expect("seed stored owner"));
+                        }
+                        Case::TenantReadFails => state.db.pool().close().await,
+                        Case::CleanOwner => {}
                     }
-                    Case::CleanOwner => {}
-                }
-                admit_owned_in_shadow(&state, agent, owner).await;
-            });
-            assert_eq!(records, [expected], "{case:?}");
+                    admit_owned_in_shadow(&state, agent, owner).await;
+                });
+                assert_eq!(records, [expected], "{case:?}");
+            }
         }
     }
 
