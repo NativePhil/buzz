@@ -1907,8 +1907,14 @@ pub(crate) mod tests {
     }
 
     /// Serve `upgrade` on a local WebSocket, connect once, read until the
-    /// server ends the socket, and return the connection's close lines.
-    async fn close_lines_of<F, Fut>(upgrade: F) -> Vec<serde_json::Value>
+    /// server ends the socket, and return the data frames the client received
+    /// and the connection's close lines.
+    async fn close_lines_of<F, Fut>(
+        upgrade: F,
+    ) -> (
+        Vec<tokio_tungstenite::tungstenite::Message>,
+        Vec<serde_json::Value>,
+    )
     where
         F: Fn(axum::extract::ws::WebSocket) -> Fut + Clone + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -1929,16 +1935,20 @@ pub(crate) mod tests {
         let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .expect("connect");
+        let mut frames = Vec::new();
         while let Ok(Some(Ok(frame))) =
             tokio::time::timeout(std::time::Duration::from_secs(3), client.next()).await
         {
             if frame.is_close() {
                 break;
             }
+            if frame.is_text() || frame.is_binary() {
+                frames.push(frame);
+            }
         }
         let lines = close_lines(&out).await;
         server.abort();
-        lines
+        (frames, lines)
     }
 
     /// A connection cancelled during the community-active startup check
@@ -1950,7 +1960,7 @@ pub(crate) mod tests {
         let assertion =
             buzz_auth::VerifiedAssertion::for_test(Some(key.public_key()), vec![deadline]);
         let state = crate::state::tests::test_state().await;
-        let lines = close_lines_of(move |socket| {
+        let (_, lines) = close_lines_of(move |socket| {
             let (state, assertion) = (Arc::clone(&state), assertion.clone());
             async move {
                 handle_connection(
@@ -1982,31 +1992,27 @@ pub(crate) mod tests {
         let mut state = (*crate::state::tests::test_state().await).clone();
         state.conn_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
         let state = Arc::new(state);
-        let lines = close_lines_of(move |socket| {
+        let (frames, lines) = close_lines_of(move |socket| {
             let state = Arc::clone(&state);
             async move {
-                let tenant = TenantContext::resolved(
-                    buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
-                    "test.local".to_owned(),
-                );
-                let addr = "127.0.0.1:9999".parse().unwrap();
-                let close =
-                    crate::access::CloseLine::open(Uuid::new_v4(), tenant.community(), addr, None);
-                handle_active_connection(
+                handle_connection(
                     socket,
                     state,
-                    addr,
-                    tenant,
-                    close,
-                    CommunityConnectionControl::new(CancellationToken::new()),
+                    "127.0.0.1:9999".parse().unwrap(),
+                    None,
+                    TenantContext::resolved(
+                        buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                        "test.local".to_owned(),
+                    ),
+                    None,
                     None,
                     chrono::Utc::now(),
-                    None,
                 )
                 .await
             }
         })
         .await;
+        assert!(frames.is_empty(), "refused socket was served: {frames:?}");
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert_eq!(lines[0]["refused"], "connection_limit", "{}", lines[0]);
     }
