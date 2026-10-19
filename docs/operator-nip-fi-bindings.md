@@ -98,8 +98,8 @@ no binding.
 ## Lookup route
 
 `GET /operator/communities/nip-fi-binding?host=<host>` is operator-signed and
-returns `{"host": ..., "active": ..., "issuers": [...]}`. kgoose relies on this
-contract:
+returns `{"host": ..., "active": ..., "issuers": [...], "agent_assertions": ...}`.
+kgoose relies on this contract:
 
 - `host` is the host stored on the community row.
 - Every lifecycle state answers 200. `active` is `false` once the community is
@@ -108,6 +108,8 @@ contract:
 - `issuers` is `[]` when `BUZZ_NIP_FI_PROVISION_BINDING` is unset, the host is
   not bindable, or nothing is bound. Only issuers in `BUZZ_NIP_FI_ISSUERS` are
   reported, in byte order.
+- `agent_assertions` is always present and mirrors
+  `BUZZ_NIP_FI_AGENT_ASSERTIONS`. kgoose refuses agent tokens when it is `false`.
 - 404 means no community has this host; 400 means the host is malformed.
 
 ## Rollout

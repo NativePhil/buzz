@@ -967,6 +967,7 @@ pub async fn community_nip_fi_binding(
         "host": record.host,
         "active": record.active,
         "issuers": issuers,
+        "agent_assertions": state.config.nip_fi.agent_assertions,
     })))
 }
 
@@ -2697,6 +2698,33 @@ mod postgres_tests {
                 // The unconfigured issuer is stored but never reported.
                 assert_eq!(json["issuers"], serde_json::json!([issuer]));
             }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn nip_fi_binding_route_reports_the_agent_assertions_setting() {
+        for enabled in [false, true] {
+            let operator = Keys::generate();
+            let (policy, _, host) = reserved_host_policy();
+            let Some(mut state) =
+                operator_test_state_with_policy(std::slice::from_ref(&operator), Some(policy))
+                    .await
+            else {
+                return;
+            };
+            let state_mut = Arc::get_mut(&mut state).expect("unshared test state");
+            Arc::make_mut(&mut state_mut.config).nip_fi.agent_assertions = enabled;
+            state
+                .db
+                .ensure_configured_community_with_nip_fi_issuers(
+                    &host,
+                    &[NIP_FI_ISSUER.to_string()],
+                )
+                .await
+                .expect("seed bound community");
+            let lookup = nip_fi_lookup(state, &operator, &host).await;
+            assert_eq!(lookup["agent_assertions"], enabled, "{host}");
         }
     }
 
