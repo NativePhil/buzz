@@ -7508,14 +7508,14 @@ mod tests {
             };
             #[derive(Clone, Copy, Debug)]
             enum Case {
-                CleanOwner,
-                BannedOwner,
-                OtherStoredOwner,
+                Clean,
+                Banned,
+                OtherStored,
             }
             let cases: [(Case, &[&str]); 3] = [
-                (Case::CleanOwner, &[]),
-                (Case::BannedOwner, &["owner/denied"]),
-                (Case::OtherStoredOwner, &["owner/denied"]),
+                (Case::Clean, &[]),
+                (Case::Banned, &["owner/denied"]),
+                (Case::OtherStored, &["owner/denied"]),
             ];
             for (case, expected) in cases {
                 let records = shadow_records(async move {
@@ -7537,7 +7537,7 @@ mod tests {
                     let (agent, owner) = (nostr::Keys::generate(), nostr::Keys::generate());
                     let owner_bytes = owner.public_key().to_bytes();
                     match case {
-                        Case::BannedOwner => {
+                        Case::Banned => {
                             state
                                 .db
                                 .ban_community_member(
@@ -7550,7 +7550,7 @@ mod tests {
                                 .await
                                 .expect("ban owner");
                         }
-                        Case::OtherStoredOwner => {
+                        Case::OtherStored => {
                             let prior = nostr::Keys::generate().public_key();
                             for key in [agent.public_key(), prior] {
                                 state
@@ -7569,7 +7569,7 @@ mod tests {
                                 .await
                                 .expect("seed stored owner"));
                         }
-                        Case::CleanOwner => {}
+                        Case::Clean => {}
                     }
                     let session = crate::nip_fi_shadow_session::ShadowSession::start(
                         &state,
