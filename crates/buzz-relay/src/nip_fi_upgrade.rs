@@ -550,9 +550,10 @@ mod tests {
     // carries that owner into the session (where AUTH applies owner bans);
     // an agent token without one, a human token carrying one (valid or null),
     // an agent token under an `at+jwt` policy and an unknown type are
-    // refused `evidence rejected`. Mutations: accept `nip-fi-agent+jwt` under
-    // `at+jwt`, skip the owner rule, or accept any `nip-fi*` type in
-    // `enforce_token_type` → RED.
+    // refused `evidence rejected`. Every token carries valid `at+jwt` claims,
+    // so the `at+jwt` case is refused only for its type. Mutations: accept
+    // `nip-fi-agent+jwt` under `at+jwt`, skip the owner rule, or accept any
+    // `nip-fi*` type in `enforce_token_type` → RED.
     #[test]
     fn upgrade_binds_the_owner_claim_to_the_agent_token_type() {
         use crate::nip_fi_core::test_support::{

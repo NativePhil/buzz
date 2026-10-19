@@ -393,6 +393,9 @@ pub(crate) mod test_support {
     }
 
     /// Sign an assertion with an explicit `typ` and raw `nostr_owner_pubkey`.
+    /// It also carries claims satisfying [`at_jwt_class`] (`client_id`,
+    /// resource-owner `sub_type`), so under an `at+jwt` policy only `typ`
+    /// decides; dedicated policies ignore them.
     pub(crate) fn sign_assertion(
         typ: &str,
         pubkey_hex: &str,
@@ -407,6 +410,8 @@ pub(crate) mod test_support {
             "exp": now + 600,
             "sub": "test-subject",
             "nostr_pubkey": pubkey_hex,
+            "client_id": "test-client",
+            "sub_type": "user",
         });
         if let Some(owner) = owner {
             claims[buzz_auth::NOSTR_OWNER_PUBKEY_CLAIM] = owner;
