@@ -686,14 +686,14 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
         .await
         {
             let (message, reason) = match e.into_legacy() {
-                IngestError::Internal(_) => (
+                // `into_legacy` never returns `Ban`; it would fail closed here.
+                IngestError::Internal(_) | IngestError::Ban { .. } => (
                     "error: internal error checking restriction state".to_string(),
                     "error",
                 ),
                 IngestError::AuthFailed(m)
                 | IngestError::Rejected(m)
                 | IngestError::CanvasConflict(m) => (m, "auth"),
-                IngestError::Ban { .. } => unreachable!("into_legacy removes ban refusals"),
             };
             reject(reason);
             conn.send(RelayMessage::ok(&event_id_hex, false, &message));
@@ -827,7 +827,10 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
                     IngestError::CanvasConflict(message) => (message, "invalid"),
                     IngestError::AuthFailed(message) => (message, "auth"),
                     IngestError::Internal(message) => (message, "error"),
-                    IngestError::Ban { .. } => unreachable!("into_legacy removes ban refusals"),
+                    // `into_legacy` never returns `Ban`; it would fail closed here.
+                    IngestError::Ban { .. } => {
+                        ("error: internal server error".to_string(), "error")
+                    }
                 };
                 reject(reason);
                 conn.send(RelayMessage::ok(&event_id_hex, false, &message));
@@ -893,8 +896,10 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
                 IngestError::Rejected(m) => (m.clone(), "invalid"),
                 IngestError::CanvasConflict(m) => (m.clone(), "invalid"),
                 IngestError::AuthFailed(m) => (m.clone(), "auth"),
-                IngestError::Internal(_) => ("error: internal server error".to_string(), "error"),
-                IngestError::Ban { .. } => unreachable!("into_legacy removes ban refusals"),
+                // `into_legacy` never returns `Ban`; it would fail closed here.
+                IngestError::Internal(_) | IngestError::Ban { .. } => {
+                    ("error: internal server error".to_string(), "error")
+                }
             };
             reject(reason);
             conn.send(RelayMessage::ok(&event_id_hex, false, &msg));

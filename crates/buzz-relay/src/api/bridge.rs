@@ -1342,7 +1342,15 @@ async fn submit_event_authed(
                 response: e.into(),
             }
         }
-        Err(IngestError::Ban { .. }) => unreachable!("into_legacy removes ban refusals"),
+        // `into_legacy` never returns `Ban`; it would fail closed here.
+        Err(IngestError::Ban { .. }) => {
+            crate::handlers::ingest::reject_with_transport("http", "error");
+            let e = internal_error("ban refusal reached the legacy mapping");
+            SubmitOutcome::Err {
+                status: e.0,
+                response: e.into(),
+            }
+        }
         Err(IngestError::Internal(msg)) => {
             crate::handlers::ingest::reject_with_transport("http", "error");
             let e = internal_error(&msg);
@@ -6681,6 +6689,236 @@ pub(crate) mod postgres_tests {
                         expected_body.as_bytes()
                     ),
                     "{case} {path}: {body:?}"
+                );
+            }
+        }
+    }
+
+    /// Every HTTP route that admits a NIP-FI agent token passes the token's
+    /// owner to the membership step: an agent that is itself a relay member
+    /// but whose token owner is banned gets NIP-FI's fixed denial on each one.
+    /// With the owner clear, the same requests get past admission. Mutation:
+    /// pass `None` instead of the token owner on any route (for example
+    /// media upload) → that row admits → RED.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn token_owner_reaches_membership_on_every_nip_fi_http_route() {
+        use axum::http::{header, StatusCode};
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+        use nostr::JsonUtil as _;
+        use sha2::{Digest, Sha256};
+
+        let fixture = nip_fi_enforce_test_state().await.expect("local Postgres");
+        let mut state = (*fixture).clone();
+        let config = Arc::make_mut(&mut state.config);
+        config.require_relay_membership = true;
+        config.buzz_v1_enabled = true;
+        state.nip_fi_verifier = Some(Arc::new(handler_test_verifier()));
+        let state = Arc::new(state);
+
+        let blossom = |keys: &Keys, verb: &str, host: &str, sha: &str| {
+            let exp = (nostr::Timestamp::now().as_secs() + 55).to_string();
+            let event = EventBuilder::new(Kind::from(24242), "Blossom auth")
+                .tags([
+                    Tag::parse(["t", verb]).unwrap(),
+                    Tag::parse(["expiration", exp.as_str()]).unwrap(),
+                    Tag::parse(["server", host]).unwrap(),
+                    Tag::parse(["x", sha]).unwrap(),
+                ])
+                .sign_with_keys(keys)
+                .expect("sign blossom auth");
+            format!("Nostr {}", B64.encode(event.as_json().as_bytes()))
+        };
+
+        for owner_banned in [true, false] {
+            let host = format!("owner-routes-{}.local", uuid::Uuid::new_v4().simple());
+            let community = state
+                .db
+                .ensure_configured_community(&host)
+                .await
+                .expect("ensure community")
+                .id;
+            let (agent, owner) = (Keys::generate(), Keys::generate());
+            for key in [&agent, &owner] {
+                state
+                    .db
+                    .add_relay_member(community, &key.public_key().to_hex(), "member", None)
+                    .await
+                    .expect("add member");
+            }
+            if owner_banned {
+                let owner_bytes = owner.public_key().to_bytes();
+                state
+                    .db
+                    .ban_community_member(community, &owner_bytes, &owner_bytes, None, None)
+                    .await
+                    .expect("ban owner");
+            }
+
+            let event = EventBuilder::new(Kind::TextNote, "hi")
+                .sign_with_keys(&agent)
+                .expect("sign event")
+                .as_json();
+            let filter = br#"[{"kinds":[1],"limit":1}]"#.to_vec();
+            let blob = b"blob".to_vec();
+            let sha = hex::encode(Sha256::digest(&blob));
+            let workflow = uuid::Uuid::new_v4();
+            let repo = format!("/git/{}/repo", agent.public_key().to_hex());
+            // (method, path, NIP-98 signed path or None for Blossom, body)
+            let routes: Vec<(&str, String, Option<String>, Vec<u8>)> = vec![
+                (
+                    "POST",
+                    "/events".into(),
+                    Some("/events".into()),
+                    event.into_bytes(),
+                ),
+                (
+                    "POST",
+                    "/query".into(),
+                    Some("/query".into()),
+                    filter.clone(),
+                ),
+                ("POST", "/count".into(), Some("/count".into()), filter),
+                (
+                    "POST",
+                    crate::api::gifs::SEARCH_PATH.into(),
+                    Some(crate::api::gifs::SEARCH_PATH.into()),
+                    br#"{"query":"cat"}"#.to_vec(),
+                ),
+                (
+                    "POST",
+                    crate::api::gifs::SHARE_PATH.into(),
+                    Some(crate::api::gifs::SHARE_PATH.into()),
+                    br#"{"id":"x"}"#.to_vec(),
+                ),
+                (
+                    "POST",
+                    crate::api::profiles::SEARCH_PATH.into(),
+                    Some(crate::api::profiles::SEARCH_PATH.into()),
+                    br#"{"query":"a"}"#.to_vec(),
+                ),
+                (
+                    "GET",
+                    format!("/workflows/{workflow}/runs"),
+                    Some(format!("/workflows/{workflow}/runs")),
+                    vec![],
+                ),
+                (
+                    "GET",
+                    format!("/workflows/{workflow}/runs/{workflow}/approvals"),
+                    Some(format!("/workflows/{workflow}/runs/{workflow}/approvals")),
+                    vec![],
+                ),
+                (
+                    "POST",
+                    "/api/invites".into(),
+                    Some("/api/invites".into()),
+                    b"{}".to_vec(),
+                ),
+                (
+                    "GET",
+                    "/moderation/reports".into(),
+                    Some("/moderation/reports".into()),
+                    vec![],
+                ),
+                (
+                    "GET",
+                    "/moderation/audit".into(),
+                    Some("/moderation/audit".into()),
+                    vec![],
+                ),
+                (
+                    "GET",
+                    "/moderation/restricted".into(),
+                    Some("/moderation/restricted".into()),
+                    vec![],
+                ),
+                ("PUT", "/upload".into(), None, blob.clone()),
+                ("PUT", "/media/upload".into(), None, blob),
+                ("GET", format!("/media/{sha}.png"), None, vec![]),
+                ("HEAD", format!("/media/{sha}.png"), None, vec![]),
+                (
+                    "GET",
+                    "/buzz/v1/me/sidebar".into(),
+                    Some("/buzz/v1/me/sidebar".into()),
+                    vec![],
+                ),
+                (
+                    "POST",
+                    "/buzz/v1/me/read-state".into(),
+                    Some("/buzz/v1/me/read-state".into()),
+                    br#"{"intents":[]}"#.to_vec(),
+                ),
+                // Git signs the repository root, not the request path.
+                (
+                    "GET",
+                    format!("{repo}/info/refs?service=git-upload-pack"),
+                    Some(repo.clone()),
+                    vec![],
+                ),
+                (
+                    "POST",
+                    format!("{repo}/git-upload-pack"),
+                    Some(repo.clone()),
+                    vec![],
+                ),
+                (
+                    "POST",
+                    format!("{repo}/git-receive-pack"),
+                    Some(repo.clone()),
+                    vec![],
+                ),
+                (
+                    "GET",
+                    format!("{repo}/default-branch"),
+                    Some(format!("{repo}/default-branch")),
+                    vec![],
+                ),
+                (
+                    "POST",
+                    format!("{repo}/default-branch"),
+                    Some(format!("{repo}/default-branch")),
+                    br#"{"branch":"main"}"#.to_vec(),
+                ),
+            ];
+            for (method, path, signed, body) in routes {
+                let mut headers = match signed {
+                    Some(signed) => make_nip98_headers(
+                        &agent,
+                        &format!("https://{host}{signed}"),
+                        method,
+                        &body,
+                    ),
+                    None => {
+                        let verb = if method == "PUT" { "upload" } else { "get" };
+                        let mut headers = axum::http::HeaderMap::new();
+                        headers.insert(
+                            header::AUTHORIZATION,
+                            blossom(&agent, verb, &host, &sha).parse().unwrap(),
+                        );
+                        if method == "PUT" {
+                            headers.insert("x-sha-256", sha.parse().unwrap());
+                            headers.insert(header::CONTENT_TYPE, "image/png".parse().unwrap());
+                        }
+                        headers
+                    }
+                };
+                headers.insert(
+                    buzz_auth::CLIENT_ATTACHED_HEADER,
+                    format!("Bearer {}", signed_agent_assertion(&agent, &owner))
+                        .parse()
+                        .expect("assertion header"),
+                );
+                let (status, headers, body) =
+                    oneshot_request_full(state.clone(), method, &path, &host, headers, &body).await;
+                let denied = status == StatusCode::FORBIDDEN
+                    && headers
+                        .get(header::CONTENT_TYPE)
+                        .is_some_and(|v| v == "text/plain; charset=utf-8")
+                    && (method == "HEAD" || body.as_ref() == b"authorization denied\n");
+                assert_eq!(
+                    denied, owner_banned,
+                    "{method} {path} owner_banned={owner_banned}: {status} {body:?}"
                 );
             }
         }

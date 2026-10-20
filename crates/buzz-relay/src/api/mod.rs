@@ -538,33 +538,35 @@ pub mod relay_members {
         Unavailable,
     }
 
-    /// Read-only twin of [`link_agent_owner`]'s conflict rule, for shadow
-    /// mode: the link it would return, writing nothing. Keep the two in step.
+    /// The agent's stored owner compared with `owner`, or `None` when the
+    /// agent has no stored owner yet. Shadow and enforce both apply the
+    /// owner-conflict rule through this read; [`link_agent_owner`] writes only
+    /// when it returns `None`.
     pub(crate) async fn stored_owner_link(
         state: &AppState,
         community: CommunityId,
         agent: &nostr::PublicKey,
         owner: &nostr::PublicKey,
-    ) -> OwnerLink {
+    ) -> Option<OwnerLink> {
         match state
             .db
             .get_agent_channel_policy(community, agent.as_bytes())
             .await
         {
-            Ok(Some((_, Some(stored)))) if stored.as_slice() != owner.as_bytes() => {
-                OwnerLink::Conflict
+            Ok(Some((_, Some(stored)))) if stored.as_slice() == owner.as_bytes() => {
+                Some(OwnerLink::Linked)
             }
-            Ok(_) => OwnerLink::Linked,
+            Ok(Some((_, Some(_)))) => Some(OwnerLink::Conflict),
+            Ok(_) => None,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to read agent_owner_pubkey");
-                OwnerLink::Unavailable
+                Some(OwnerLink::Unavailable)
             }
         }
     }
 
     /// [`materialize_nip_oa_owner`], distinguishing a different stored owner
-    /// from a failed read or write. Shadow mirrors its conflict rule in
-    /// [`stored_owner_link`].
+    /// from a failed read or write.
     pub async fn link_agent_owner(
         state: &AppState,
         tenant: &TenantContext,
@@ -579,6 +581,28 @@ pub mod relay_members {
         if state.observer_owner_cache.get(&owner_key) == Some(true) {
             return OwnerLink::Linked;
         }
+        let link = match stored_owner_link(state, tenant.community(), agent, owner).await {
+            Some(link) => link,
+            None => write_agent_owner(state, tenant, agent, owner).await,
+        };
+        if link == OwnerLink::Linked {
+            state
+                .author_type_cache
+                .insert((tenant.community(), agent.to_bytes().to_vec()), true);
+            state.observer_owner_cache.insert(owner_key, true);
+        }
+        link
+    }
+
+    /// Record `owner` for an agent that had none when read. The write is
+    /// first-write-wins, so a concurrent writer that got there first is
+    /// judged by the same read.
+    async fn write_agent_owner(
+        state: &AppState,
+        tenant: &TenantContext,
+        agent: &nostr::PublicKey,
+        owner: &nostr::PublicKey,
+    ) -> OwnerLink {
         for (role, pubkey) in [("agent", agent), ("owner", owner)] {
             match state
                 .db
@@ -599,8 +623,7 @@ pub mod relay_members {
                 }
             }
         }
-
-        let link = match state
+        match state
             .db
             .set_agent_owner_for_authorization(
                 tenant.community(),
@@ -616,31 +639,15 @@ pub mod relay_members {
                 state.disconnect_unowned_agent_clusterwide(tenant, &agent.to_bytes());
                 OwnerLink::Linked
             }
-            Ok(false) => match state
-                .db
-                .is_agent_owner(tenant.community(), agent.as_bytes(), owner.as_bytes())
+            // Another writer stored an owner first.
+            Ok(false) => stored_owner_link(state, tenant.community(), agent, owner)
                 .await
-            {
-                Ok(true) => OwnerLink::Linked,
-                Ok(false) => OwnerLink::Conflict,
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to read agent_owner_pubkey");
-                    OwnerLink::Unavailable
-                }
-            },
+                .unwrap_or(OwnerLink::Unavailable),
             Err(e) => {
                 tracing::warn!(error = %e, "failed to backfill agent_owner_pubkey");
                 OwnerLink::Unavailable
             }
-        };
-
-        if link == OwnerLink::Linked {
-            state
-                .author_type_cache
-                .insert((tenant.community(), agent.to_bytes().to_vec()), true);
-            state.observer_owner_cache.insert(owner_key, true);
         }
-        link
     }
 
     #[cfg(test)]

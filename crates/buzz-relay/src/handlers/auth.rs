@@ -135,7 +135,10 @@ pub(crate) async fn token_owner_denial(
     if let Some(denial) = ban_admission_denial(ban) {
         return Some(denial.class);
     }
-    let link = crate::api::relay_members::stored_owner_link(state, community, &agent, &owner).await;
+    // No stored owner yet: enforce would link this one.
+    let link = crate::api::relay_members::stored_owner_link(state, community, &agent, &owner)
+        .await
+        .unwrap_or(crate::api::relay_members::OwnerLink::Linked);
     owner_link_denial(link, true).map(|denial| denial.class)
 }
 
