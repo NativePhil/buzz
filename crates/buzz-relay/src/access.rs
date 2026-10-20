@@ -369,8 +369,14 @@ impl Drop for ReadLog {
             ("count", _) => (None, None),
             _ => (Some(self.results), None),
         };
+        // A client closing mid-read (`aborted`) or a refusal is routine; only
+        // a server-side failure is a WARN.
+        let level = match self.outcome {
+            ReadOutcome::Error(_) => Level::WARN,
+            _ => Level::INFO,
+        };
         emit!(
-            Level::INFO,
+            level,
             event = self.event,
             conn_id = %self.conn_id,
             community = %self.community,
@@ -1477,6 +1483,40 @@ pub(crate) mod tests {
         assert_eq!(
             (s.kind_count, s.author_count, s.channel_count, s.p_count),
             (1, 1, 1, 1)
+        );
+    }
+
+    /// A read's level follows its outcome: only a server-side error is WARN.
+    #[test]
+    fn read_lines_warn_only_on_error() {
+        let read = |outcome| ReadLog {
+            event: "req",
+            conn_id: Uuid::nil(),
+            community: CommunityId::from_uuid(Uuid::nil()),
+            pubkey: None,
+            sub_id: "s".into(),
+            summary: FilterSummary::default(),
+            outcome,
+            results: 0,
+            budget: None,
+        };
+        let (_, out) = capture(|| {
+            drop(read(ReadOutcome::Error("database_error")));
+            drop(read(ReadOutcome::Aborted));
+            drop(read(ReadOutcome::Denied("auth_required")));
+        });
+        let levels: Vec<_> = out
+            .lines()
+            .iter()
+            .map(|l| format!("{}={}", l["outcome"], l["level"]))
+            .collect();
+        assert_eq!(
+            levels,
+            [
+                r#""error"="WARN""#,
+                r#""aborted"="INFO""#,
+                r#""denied"="INFO""#
+            ]
         );
     }
 
