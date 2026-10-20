@@ -310,7 +310,8 @@ impl ReadLog {
             pubkey,
             sub_id: sub_id.to_owned(),
             // The summary is the costly part; skip it when the line is off.
-            summary: if tracing::enabled!(target: TARGET, Level::INFO) {
+            // An `error` line is WARN, so it keeps the summary at `=warn`.
+            summary: if tracing::enabled!(target: TARGET, Level::WARN) {
                 FilterSummary::new(filters)
             } else {
                 FilterSummary::default()
@@ -1528,6 +1529,45 @@ pub(crate) mod tests {
                 r#""denied"="INFO""#
             ]
         );
+    }
+
+    /// Under `buzz_relay::access=warn` an `error` read still carries its
+    /// filter summary, and never the search text.
+    #[test]
+    fn warn_only_error_lines_keep_the_filter_summary() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let (conn, _rx) =
+            crate::connection::tests::test_conn_with_auth(crate::connection::AuthState::Failed);
+        let filters = [filter(serde_json::json!({
+            "kinds": [9], "#h": [Uuid::nil().to_string()], "since": 10,
+            "search": "secret words",
+        }))];
+        let out = Captured::default();
+        let writer = out.clone();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .flatten_event(true)
+                    .with_writer(move || writer.clone()),
+            )
+            .with(tracing_subscriber::filter::Targets::new().with_target(TARGET, Level::WARN));
+        let _lock = crate::test_support::tracing_dispatch_lock();
+        tracing::subscriber::with_default(subscriber, || {
+            ReadLog::req(&conn, "s", &filters).error("database_error");
+            ReadLog::count(&conn, "c", &filters).error("database_error");
+        });
+        assert!(!out.raw().contains("secret"), "{}", out.raw());
+        let lines = out.lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for line in &lines {
+            assert_eq!(line["level"], "WARN", "{line}");
+            assert_eq!(line["filters"], 1, "{line}");
+            assert_eq!(line["kinds"], "9", "{line}");
+            assert_eq!(line["channel_count"], 1, "{line}");
+            assert_eq!(line["since"], 10, "{line}");
+            assert_eq!(line["search"], true, "{line}");
+        }
     }
 
     /// A detached read holding the close line past the connection's end
