@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -35,6 +35,7 @@ use crate::membership::MeshMembership;
 use crate::peer::MeshPeer;
 use crate::registry::{ReadyRecord, ReadyRegistry};
 use crate::status::ConnectionState;
+use crate::telemetry;
 use crate::wire::{MeshStreamFrame, StreamHello, StreamRole};
 use crate::{InboundHandler, MeshDatagram, MeshError, MeshStream, RelayPeerTransport, RuntimeId};
 
@@ -327,22 +328,39 @@ async fn reconcile_loop(inner: Arc<Inner>) {
 }
 
 async fn reconcile_once(inner: &Arc<Inner>) {
+    let started = Instant::now();
+    let pruned = inner.membership.prune_expired();
+    if pruned > 0 {
+        tracing::info!(pruned, "mesh: pruned expired peer records");
+    }
+
     if let Some(registry) = &inner.registry {
         match registry.scan_ready().await {
             Ok(records) => inner.membership.apply_ready_records(records),
             Err(err) => tracing::warn!(%err, "mesh: registry scan failed"),
         }
     }
+    inner.membership.publish_table_metrics();
 
     let local = inner.endpoint.runtime_id();
-    let candidates: Vec<_> = inner
-        .membership
-        .records()
-        .into_iter()
-        .filter(|record| record.runtime_id != local && !record.draining)
-        .collect();
+    let candidates: Vec<_> = {
+        let peers = inner.peers.read().expect("peer lock poisoned");
+        inner
+            .membership
+            .records()
+            .into_iter()
+            .filter(|record| {
+                record.runtime_id != local
+                    && !record.draining
+                    && !peers.contains_key(&record.runtime_id)
+            })
+            .collect()
+    };
+    metrics::gauge!(telemetry::RECONCILE_CANDIDATES).set(candidates.len() as f64);
 
     for record in candidates {
+        // A connection can land mid-pass (inbound accept, or an earlier dial's
+        // tie-break), so recheck before each dial.
         let already_connected = inner
             .peers
             .read()
@@ -353,6 +371,7 @@ async fn reconcile_once(inner: &Arc<Inner>) {
         }
         dial_peer(inner, &record).await;
     }
+    metrics::histogram!(telemetry::RECONCILE_PASS_SECONDS).record(started.elapsed().as_secs_f64());
 }
 
 async fn dial_peer(inner: &Arc<Inner>, record: &crate::gossip::GossipRecord) {
@@ -374,7 +393,10 @@ async fn dial_peer(inner: &Arc<Inner>, record: &crate::gossip::GossipRecord) {
         inner
             .membership
             .mark_connection_state(record.runtime_id, ConnectionState::Connecting);
-        match inner.endpoint.connect(endpoint_addr).await {
+        let started = Instant::now();
+        let result = inner.endpoint.connect(endpoint_addr).await;
+        telemetry::record_dial(result.is_ok(), started.elapsed());
+        match result {
             Ok(peer) => {
                 install_peer(inner, peer, true);
                 return;
@@ -880,6 +902,91 @@ mod tests {
         .expect("datagram should flow after tie-break");
         a.shutdown();
         b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn reconcile_pass_publishes_dial_and_peer_table_metrics() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        // Current-thread runtime: the local recorder also sees the spawned
+        // reconcile loop, which is why the dial assertions are lower bounds.
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let (a, _) = runtime(5).await;
+        // A bare endpoint (no runtime) so only `a` publishes metrics.
+        let b = MeshEndpoint::bind_with_secret_key(SecretKey::from_bytes(&[6; 32]), loopback_any())
+            .await
+            .unwrap();
+        let b_addrs: Vec<String> = b.ip_addrs().iter().map(|s| s.to_string()).collect();
+        // Accept every dial (the spawned reconcile loop may dial too) and
+        // keep the connections open; report the first.
+        let (accepted_tx, mut accepted_rx) = mpsc::channel(8);
+        let b_accept = tokio::spawn({
+            let b = b.clone();
+            async move {
+                let mut held = Vec::new();
+                while let Ok(Some(peer)) = b.accept().await {
+                    let _ = accepted_tx.try_send(());
+                    held.push(peer);
+                }
+            }
+        });
+        a.membership()
+            .apply_gossip_record(GossipRecord::new(b.runtime_id(), b_addrs, 1));
+
+        a.reconcile_now().await;
+        timeout(Duration::from_secs(5), accepted_rx.recv())
+            .await
+            .expect("b should accept a's dial");
+
+        let mut dial_ok = 0;
+        let mut dial_samples = 0;
+        let mut pass_samples = 0;
+        let mut peer_records = 0.0;
+        let mut saw_candidates = false;
+        let mut saw_max_age = false;
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            let key = key.key();
+            let label = |name: &str| {
+                key.labels()
+                    .find(|l| l.key() == name)
+                    .map(|l| l.value().to_owned())
+            };
+            match (key.name(), value) {
+                (telemetry::DIAL_TOTAL, DebugValue::Counter(n))
+                    if label("outcome").as_deref() == Some("ok") =>
+                {
+                    dial_ok += n
+                }
+                (telemetry::DIAL_DURATION_SECONDS, DebugValue::Histogram(v)) => {
+                    dial_samples += v.len()
+                }
+                (telemetry::RECONCILE_PASS_SECONDS, DebugValue::Histogram(v)) => {
+                    pass_samples += v.len()
+                }
+                (telemetry::PEER_RECORDS, DebugValue::Gauge(v)) => peer_records += v.into_inner(),
+                (telemetry::RECONCILE_CANDIDATES, DebugValue::Gauge(_)) => saw_candidates = true,
+                (telemetry::PEER_RECORD_MAX_AGE_SECONDS, DebugValue::Gauge(_)) => {
+                    saw_max_age = true
+                }
+                _ => {}
+            }
+        }
+        assert!(dial_ok >= 1, "successful dial must be counted as ok");
+        assert!(dial_samples >= 1, "dial duration must be recorded");
+        assert!(
+            pass_samples >= 1,
+            "reconcile pass duration must be recorded"
+        );
+        assert_eq!(
+            peer_records, 1.0,
+            "exactly one peer record (b) across all series"
+        );
+        assert!(saw_candidates && saw_max_age);
+        a.shutdown();
+        b_accept.abort();
     }
 
     #[test]

@@ -3,18 +3,34 @@
 //! This module implements the relay-facing [`RelayMeshMembership`] seam. It is
 //! deliberately incapable of electing session owners: peers here are dial/routing
 //! hints only, and liveness disagreement never performs takeover.
+//!
+//! **Record lifetime.** Every boot gets a fresh runtime id, so a restarted pod
+//! leaves its old record behind. A live runtime refreshes `heartbeat_millis`
+//! every gossip tick; a record whose heartbeat is older than the peer-record
+//! TTL belongs to a dead process. Such records are rejected on arrival, left
+//! out of digests, deltas, and dial candidates, and pruned from the table, so
+//! scuttlebutt can no longer keep a dead runtime alive fleet-wide.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::gossip::{system_time_from_millis, GossipRecord, PhiAccrual};
 use crate::registry::ReadyRecord;
 use crate::status::{ConnectionState, MeshCounters, MeshPeerCounters, MeshPeerStatus, MeshStatus};
+use crate::telemetry::PeerTableStats;
 use crate::{PeerInfo, RelayMeshMembership, RuntimeId};
 
 pub const DEFAULT_PHI_SUSPECT_THRESHOLD: f64 = 8.0;
+
+/// How long a peer record survives without a fresher heartbeat.
+///
+/// Live runtimes refresh every [`crate::runtime::DEFAULT_GOSSIP_INTERVAL`]
+/// (2s), and the ready registry expires a silent runtime after 45s. Five
+/// minutes sits well past both, so cross-pod clock skew and multi-hop gossip
+/// delay never expire a live runtime.
+pub const DEFAULT_PEER_RECORD_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Debug)]
 struct PeerState {
@@ -40,6 +56,8 @@ pub struct MeshMembership {
     /// unanchored state is fail-closed, not accept-any.
     expected_relay_pubkey: Option<String>,
     phi_suspect_threshold: f64,
+    /// Records whose heartbeat is older than this are dead; see the module docs.
+    peer_record_ttl: Duration,
 }
 
 impl MeshMembership {
@@ -53,6 +71,7 @@ impl MeshMembership {
             foreign_relay_rejections: Arc::new(AtomicU64::new(0)),
             expected_relay_pubkey: None,
             phi_suspect_threshold: DEFAULT_PHI_SUSPECT_THRESHOLD,
+            peer_record_ttl: DEFAULT_PEER_RECORD_TTL,
         }
     }
 
@@ -66,6 +85,19 @@ impl MeshMembership {
     pub fn with_phi_suspect_threshold(mut self, threshold: f64) -> Self {
         self.phi_suspect_threshold = threshold;
         self
+    }
+
+    /// Override [`DEFAULT_PEER_RECORD_TTL`].
+    pub fn with_peer_record_ttl(mut self, ttl: Duration) -> Self {
+        self.peer_record_ttl = ttl;
+        self
+    }
+
+    /// Whether `record`'s heartbeat is older than the peer-record TTL at
+    /// `now_millis`. A heartbeat ahead of our clock (skew) is fresh.
+    fn is_expired(&self, record: &GossipRecord, now_millis: u64) -> bool {
+        let age = Duration::from_millis(now_millis.saturating_sub(record.heartbeat_millis));
+        age > self.peer_record_ttl
     }
 
     pub fn local_record(&self) -> GossipRecord {
@@ -116,9 +148,18 @@ impl MeshMembership {
         }
     }
 
-    /// Apply a gossiped record if it is newer than the local copy.
+    /// Apply a gossiped record if it is newer than the local copy and its
+    /// heartbeat has not expired.
+    ///
+    /// A record learned here is a dial hint, not a connection: a new peer
+    /// enters `Disconnected`, and an update never changes connection state.
+    /// Only the runtime's real connect/disconnect paths do that.
     pub fn apply_gossip_record(&self, record: GossipRecord) -> bool {
         if record.runtime_id == self.local_runtime_id {
+            return false;
+        }
+        if self.is_expired(&record, crate::gossip::now_millis()) {
+            crate::telemetry::record_expired("rejected", 1);
             return false;
         }
 
@@ -128,7 +169,6 @@ impl MeshMembership {
             Some(peer) if record.version <= peer.record.version => false,
             Some(peer) => {
                 peer.record = record;
-                peer.connection_state = ConnectionState::Connected;
                 peer.phi.observe(heartbeat);
                 true
             }
@@ -144,7 +184,7 @@ impl MeshMembership {
                         },
                         record,
                         phi,
-                        connection_state: ConnectionState::Connected,
+                        connection_state: ConnectionState::Disconnected,
                     },
                 );
                 true
@@ -191,17 +231,55 @@ impl MeshMembership {
             .contains_key(&runtime_id)
     }
 
-    /// All known gossip records (local + peers), for reconcile/dial decisions.
+    /// All live gossip records (local + unexpired peers), for reconcile/dial
+    /// decisions and gossip digests/deltas. Expired records are left out even
+    /// before [`Self::prune_expired`] removes them, so they are never dialed
+    /// or re-gossiped.
     pub fn records(&self) -> Vec<GossipRecord> {
+        self.records_at(crate::gossip::now_millis())
+    }
+
+    fn records_at(&self, now_millis: u64) -> Vec<GossipRecord> {
         let mut records: Vec<GossipRecord> = self
             .peers
             .read()
             .expect("membership lock poisoned")
             .values()
+            .filter(|peer| !self.is_expired(&peer.record, now_millis))
             .map(|peer| peer.record.clone())
             .collect();
         records.push(self.local_record());
         records
+    }
+
+    /// Drop every peer whose heartbeat has expired. Returns how many went.
+    pub fn prune_expired(&self) -> usize {
+        self.prune_expired_at(crate::gossip::now_millis())
+    }
+
+    fn prune_expired_at(&self, now_millis: u64) -> usize {
+        let mut peers = self.peers.write().expect("membership lock poisoned");
+        let before = peers.len();
+        peers.retain(|_, peer| !self.is_expired(&peer.record, now_millis));
+        let pruned = before - peers.len();
+        drop(peers);
+        crate::telemetry::record_expired("pruned", pruned as u64);
+        pruned
+    }
+
+    /// Publish peer-table size and staleness gauges.
+    pub(crate) fn publish_table_metrics(&self) {
+        self.table_stats(SystemTime::now()).publish();
+    }
+
+    fn table_stats(&self, now: SystemTime) -> PeerTableStats {
+        let mut stats = PeerTableStats::default();
+        for status in self.peer_statuses(now) {
+            let heartbeat = system_time_from_millis(status.last_heartbeat_millis);
+            let age = now.duration_since(heartbeat).unwrap_or_default();
+            stats.record(status.connection_state, status.draining, age);
+        }
+        stats
     }
 
     /// Scuttlebutt digest over every record this runtime knows (local + peers).
@@ -397,15 +475,15 @@ impl RelayMeshMembership for MeshMembership {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, UNIX_EPOCH};
-
     use super::*;
+    use crate::gossip::now_millis;
 
     fn rid(byte: u8) -> RuntimeId {
         RuntimeId([byte; 32])
     }
 
-    fn record(byte: u8, version: u64, heartbeat_secs: u64) -> GossipRecord {
+    /// A peer record whose heartbeat is `age_secs` old.
+    fn record(byte: u8, version: u64, age_secs: u64) -> GossipRecord {
         GossipRecord {
             runtime_id: rid(byte),
             endpoint_addrs: vec![format!("127.0.0.{byte}:3478")],
@@ -414,10 +492,7 @@ mod tests {
             draining: false,
             capabilities: vec!["reliable-stream".to_string()],
             version,
-            heartbeat_millis: (UNIX_EPOCH + Duration::from_secs(heartbeat_secs))
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
+            heartbeat_millis: now_millis() - age_secs * 1_000,
         }
     }
 
@@ -496,6 +571,95 @@ mod tests {
         assert_eq!(status.counters.stale_generation_rejections, 1);
         assert_eq!(status.peers[0].counters.datagrams_sent, 1);
         assert_eq!(status.peers[0].counters.stale_generation_rejections, 1);
+    }
+
+    const TTL_SECS: u64 = DEFAULT_PEER_RECORD_TTL.as_secs();
+
+    #[test]
+    fn expired_gossip_record_is_rejected() {
+        let membership = MeshMembership::new(record(1, 1, 0));
+        assert!(!membership.apply_gossip_record(record(2, 1, TTL_SECS + 1)));
+        assert!(membership.status().peers.is_empty());
+        assert!(!membership.has_peer(rid(2)));
+        // A fresh record for the same runtime is still admitted.
+        assert!(membership.apply_gossip_record(record(2, 2, 0)));
+        assert!(membership.has_peer(rid(2)));
+    }
+
+    #[test]
+    fn prune_drops_only_expired_records() {
+        let membership = MeshMembership::new(record(1, 1, 0));
+        membership.apply_gossip_record(record(2, 1, 0));
+        membership.apply_gossip_record(record(3, 1, 200));
+        // 150s later: rid(3) is 350s old (expired), rid(2) is 150s (live).
+        let later = now_millis() + 150_000;
+        assert_eq!(membership.prune_expired_at(later), 1);
+        assert!(membership.has_peer(rid(2)));
+        assert!(!membership.has_peer(rid(3)));
+        assert_eq!(membership.prune_expired_at(later), 0);
+    }
+
+    #[test]
+    fn expired_records_are_not_dialed_or_gossiped_before_prune() {
+        let membership = MeshMembership::new(record(1, 1, 0));
+        membership.apply_gossip_record(record(2, 1, 0));
+        membership.apply_gossip_record(record(3, 1, 200));
+        let later = now_millis() + 150_000;
+        let ids: Vec<_> = membership
+            .records_at(later)
+            .into_iter()
+            .map(|r| r.runtime_id)
+            .collect();
+        assert!(ids.contains(&rid(1)), "local record is always present");
+        assert!(ids.contains(&rid(2)));
+        assert!(
+            !ids.contains(&rid(3)),
+            "expired record must not be a candidate"
+        );
+        // Still in the table until a prune runs.
+        assert!(membership.has_peer(rid(3)));
+    }
+
+    #[test]
+    fn gossip_never_sets_connection_state() {
+        let membership = MeshMembership::new(record(1, 1, 0));
+        let state = |m: &MeshMembership| m.status().peers[0].connection_state;
+
+        membership.apply_gossip_record(record(2, 1, 0));
+        assert_eq!(state(&membership), ConnectionState::Disconnected);
+
+        membership.mark_connection_state(rid(2), ConnectionState::Connected);
+        membership.apply_gossip_record(record(2, 2, 0));
+        assert_eq!(state(&membership), ConnectionState::Connected);
+
+        membership.mark_connection_state(rid(2), ConnectionState::Disconnected);
+        membership.apply_gossip_record(record(2, 3, 0));
+        assert_eq!(state(&membership), ConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn table_stats_count_state_and_draining_and_track_oldest_heartbeat() {
+        use crate::telemetry::CONNECTION_STATES;
+
+        let membership = MeshMembership::new(record(1, 1, 0));
+        membership.apply_gossip_record(record(2, 1, 10));
+        membership.apply_gossip_record(record(3, 1, 120));
+        membership.mark_connection_state(rid(3), ConnectionState::Connected);
+        let mut draining = record(4, 1, 30);
+        draining.draining = true;
+        membership.apply_gossip_record(draining);
+
+        let stats = membership.table_stats(SystemTime::now());
+        let count = |state, draining: bool| {
+            let index = CONNECTION_STATES.iter().position(|s| *s == state).unwrap();
+            stats.counts[index][usize::from(draining)]
+        };
+        assert_eq!(count(ConnectionState::Disconnected, false), 1);
+        assert_eq!(count(ConnectionState::Disconnected, true), 1);
+        assert_eq!(count(ConnectionState::Connected, false), 1);
+        assert_eq!(stats.counts.iter().flatten().sum::<u64>(), 3);
+        assert!(stats.max_age >= Duration::from_secs(120));
+        assert!(stats.max_age < Duration::from_secs(130));
     }
 
     #[test]
