@@ -1419,10 +1419,11 @@ async fn handle_text_message(text: String, conn: Arc<ConnectionState>, state: Ar
                 }
             };
             let span = tracing::info_span!("ws.req", conn_id = %conn.conn_id, sub_id = %sub_id);
+            let close = conn.refusal_budget.hold_close();
             tokio::spawn(
                 async move {
                     handlers::req::handle_req(sub_id, filters, before_ids, conn, state).await;
-                    drop(permit);
+                    drop((permit, close));
                 }
                 .instrument(span),
             );
@@ -1448,10 +1449,11 @@ async fn handle_text_message(text: String, conn: Arc<ConnectionState>, state: Ar
                 }
             };
             let span = tracing::info_span!("ws.count", conn_id = %conn.conn_id, sub_id = %sub_id);
+            let close = conn.refusal_budget.hold_close();
             tokio::spawn(
                 async move {
                     handlers::count::handle_count(sub_id, filters, conn, state).await;
-                    drop(permit);
+                    drop((permit, close));
                 }
                 .instrument(span),
             );
