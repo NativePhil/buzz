@@ -595,6 +595,8 @@ test-unit:
                 + test(=handlers::auth::tests::handle_auth_pairing_mismatch_runs_full_root_denial_path)
                 + test(=handlers::auth::tests::shadow_root_auth_records_pairing_denial)
                 + test(=handlers::auth::tests::shadow_root_auth_records_unavailable_owner_read)
+                + test(=handlers::ingest::postgres_tests::relay_admin_ban_maps_to_blocked_auth_failure)
+                + test(=handlers::ingest::postgres_tests::relay_admin_internal_maps_to_error_not_client_fault)
                 + test(=handlers::auth::tests::shadow_root_invalid_nip42_retires_without_record)
                 + test(=handlers::auth::tests::nip42_denial_class_separates_internal_failure_from_bad_evidence)
                 + test(=handlers::event::tests::fanout_access::owner_only_kinds_keep_only_the_owner)
