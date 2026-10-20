@@ -14576,8 +14576,15 @@ mod tests {
                 if !matches!(case, Case::NonMemberOwner) {
                     state
                         .db
-                        .add_relay_member(community, &owner.public_key().to_hex(), "member", None)
+                        .add_relay_member(
+                            community,
+                            &owner.public_key().to_hex(),
+                            "member",
+                            None,
+                            &nostr::Keys::generate(),
+                        )
                         .await
+                        .map(|write| write.outcome)
                         .expect("add owner");
                 }
                 match case {
@@ -14589,8 +14596,10 @@ mod tests {
                                 &agent.public_key().to_hex(),
                                 "member",
                                 None,
+                                &nostr::Keys::generate(),
                             )
                             .await
+                            .map(|write| write.outcome)
                             .expect("add agent");
                         let owner_bytes = owner.public_key().to_bytes();
                         state

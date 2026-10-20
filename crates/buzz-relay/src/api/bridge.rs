@@ -6574,8 +6574,15 @@ pub(crate) mod postgres_tests {
             let (agent, owner) = (Keys::generate(), Keys::generate());
             state
                 .db
-                .add_relay_member(community, &owner.public_key().to_hex(), "member", None)
+                .add_relay_member(
+                    community,
+                    &owner.public_key().to_hex(),
+                    "member",
+                    None,
+                    &nostr::Keys::generate(),
+                )
                 .await
+                .map(|write| write.outcome)
                 .expect("add owner");
             let suffix = uuid::Uuid::new_v4().simple().to_string();
             match case {
@@ -6749,8 +6756,15 @@ pub(crate) mod postgres_tests {
             for key in [&agent, &owner] {
                 state
                     .db
-                    .add_relay_member(community, &key.public_key().to_hex(), "member", None)
+                    .add_relay_member(
+                        community,
+                        &key.public_key().to_hex(),
+                        "member",
+                        None,
+                        &nostr::Keys::generate(),
+                    )
                     .await
+                    .map(|write| write.outcome)
                     .expect("add member");
             }
             if owner_banned {
@@ -6963,8 +6977,15 @@ pub(crate) mod postgres_tests {
                 let (agent, owner) = (Keys::generate(), Keys::generate());
                 state
                     .db
-                    .add_relay_member(community, &owner.public_key().to_hex(), "member", None)
+                    .add_relay_member(
+                        community,
+                        &owner.public_key().to_hex(),
+                        "member",
+                        None,
+                        &nostr::Keys::generate(),
+                    )
                     .await
+                    .map(|write| write.outcome)
                     .expect("add owner");
 
                 let (arrived, release) = arm(community);
@@ -7074,8 +7095,15 @@ pub(crate) mod postgres_tests {
             let (agent, owner) = (Keys::generate(), Keys::generate());
             state
                 .db
-                .add_relay_member(community, &owner.public_key().to_hex(), "member", None)
+                .add_relay_member(
+                    community,
+                    &owner.public_key().to_hex(),
+                    "member",
+                    None,
+                    &nostr::Keys::generate(),
+                )
                 .await
+                .map(|write| write.outcome)
                 .expect("add owner");
             let author = if token { &agent } else { &owner };
 

@@ -7389,8 +7389,15 @@ mod postgres_tests {
         let (owner, agent) = (nostr::Keys::generate(), nostr::Keys::generate());
         state
             .db
-            .add_relay_member(community, &owner.public_key().to_hex(), "member", None)
+            .add_relay_member(
+                community,
+                &owner.public_key().to_hex(),
+                "member",
+                None,
+                &nostr::Keys::generate(),
+            )
             .await
+            .map(|write| write.outcome)
             .expect("add owner");
         (TenantContext::resolved(community, &host), owner, agent)
     }
@@ -7456,8 +7463,13 @@ mod postgres_tests {
 
         state
             .db
-            .remove_relay_member(tenant.community(), &owner.public_key().to_hex())
+            .remove_relay_member(
+                tenant.community(),
+                &owner.public_key().to_hex(),
+                &nostr::Keys::generate(),
+            )
             .await
+            .map(|write| write.outcome)
             .expect("remove owner");
         assert_eq!(
             http_membership(&state, &tenant, &agent, Some(owner.public_key())).await,
@@ -7484,8 +7496,10 @@ mod postgres_tests {
                     &agent.public_key().to_hex(),
                     "member",
                     None,
+                    &nostr::Keys::generate(),
                 )
                 .await
+                .map(|write| write.outcome)
                 .expect("add agent");
             let owner_bytes = owner.public_key().to_bytes();
             state
