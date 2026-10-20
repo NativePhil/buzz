@@ -12,7 +12,7 @@ const _channel = '11111111-1111-4111-8111-111111111111';
 
 void main() {
   test(
-    'a channel loads, follows live messages, settles sends and recovers',
+    'a channel loads, follows, settles sends, recovers and detaches once left',
     () {
       fakeAsync((async) {
         final relay = FakeRelay();
@@ -27,9 +27,11 @@ void main() {
         );
         relay.seed([message('first', now - 20), message('second', now - 10)]);
 
+        // History must not wait on the live subscription's EOSE.
+        final eose = relay.holdEose();
         final container = ProviderContainer(overrides: relay.overrides);
         addTearDown(container.dispose);
-        final messages = container.listen(
+        var messages = container.listen(
           channelMessagesProvider(_channel),
           (_, _) {},
         );
@@ -62,6 +64,8 @@ void main() {
         );
         expect(timeline(), ['first', 'second']);
         expect(relay.queries, hasLength(1), reason: 'read the channel window');
+        eose.complete();
+        settle();
         expect(
           relay.reqs.where((req) => (req[1] as String).startsWith('h-')),
           isEmpty,
@@ -122,6 +126,29 @@ void main() {
         relay.deliver(message('after reconnect', liveSince()));
         settle();
         expect(timeline(), contains('after reconnect'));
+        expect(timeline().where((text) => text == 'hello'), hasLength(1));
+
+        // A chat left for a while stops following live; returning shows the
+        // cached rows at once and catches up on what arrived meanwhile.
+        bool followsChannel() => relay.liveFilters.any(
+          (filters) => filters.any(
+            (filter) => (filter['#h'] as List?)?.contains(_channel) ?? false,
+          ),
+        );
+        messages.close();
+        async.elapse(const Duration(seconds: 29));
+        expect(followsChannel(), isTrue, reason: 'a brief cover keeps it');
+        async.elapse(const Duration(seconds: 2));
+        expect(followsChannel(), isFalse);
+        relay.deliver(message('while away', liveSince() + 1));
+        messages = container.listen(
+          channelMessagesProvider(_channel),
+          (_, _) {},
+        );
+        expect(timeline(), contains('after reconnect'));
+        settle();
+        expect(followsChannel(), isTrue);
+        expect(timeline(), contains('while away'));
         expect(timeline().where((text) => text == 'hello'), hasLength(1));
       });
     },
