@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::access::AccessSlot;
-use crate::handlers::side_effects::{publish_nip43_member_added, publish_nip43_membership_list};
+use crate::handlers::side_effects::{fan_out_nip43_membership_list, publish_nip43_member_added};
 use crate::nip_fi_http::admit_nip_fi_http_on_state;
 use buzz_core::invite::{
     hash_v2_code, validate_v2_code, DEFAULT_INVITE_TTL_SECS, MAX_INVITE_TTL_SECS, MAX_INVITE_USES,
@@ -501,7 +501,7 @@ async fn claim_invite_authed(
         }
 
         let token_hash = hash_v2_code(&request.code);
-        let outcome = state
+        let write = state
             .db
             .claim_relay_invite(
                 tenant.community(),
@@ -512,20 +512,19 @@ async fn claim_invite_authed(
                     .join_policy
                     .as_ref()
                     .map(|policy| policy.version.as_str()),
+                &state.relay_keypair,
             )
             .await
             .map_err(|e| internal_error(&format!("v2 invite claim: {e}")))?;
+        fan_out_nip43_membership_list(&tenant, state, write.snapshot).await;
 
-        return match outcome {
+        return match write.outcome {
             buzz_db::relay_invite::ClaimOutcome::Joined { .. } => {
                 // NIP-43 side effects only on Joined, never on other outcomes.
                 if let Err(e) = publish_nip43_member_added(&tenant, state, &claimer_hex).await {
                     tracing::warn!(
                         "failed to publish NIP-43 member-added delta after v2 claim: {e}"
                     );
-                }
-                if let Err(e) = publish_nip43_membership_list(&tenant, state).await {
-                    tracing::warn!("failed to publish NIP-43 membership list after v2 claim: {e}");
                 }
                 Ok(Json(serde_json::json!({
                     "status": "joined",
@@ -575,7 +574,7 @@ async fn claim_invite_authed(
             .map_err(|_| api_error(StatusCode::FORBIDDEN, "join_policy_required"))?;
     }
 
-    let was_inserted = state
+    let write = state
         .db
         .claim_relay_membership(
             tenant.community(),
@@ -586,16 +585,16 @@ async fn claim_invite_authed(
                 .join_policy
                 .as_ref()
                 .map(|policy| policy.version.as_str()),
+            &state.relay_keypair,
         )
         .await
         .map_err(|e| internal_error(&format!("invite claim insert: {e}")))?;
+    let was_inserted = write.outcome;
+    fan_out_nip43_membership_list(&tenant, state, write.snapshot).await;
 
     if was_inserted {
         if let Err(e) = publish_nip43_member_added(&tenant, state, &claimer_hex).await {
             tracing::warn!("failed to publish NIP-43 member-added delta after claim: {e}");
-        }
-        if let Err(e) = publish_nip43_membership_list(&tenant, state).await {
-            tracing::warn!("failed to publish NIP-43 membership list after claim: {e}");
         }
     }
 
@@ -958,10 +957,17 @@ mod postgres_tests {
             .await
             .expect("lookup")
             .expect("community exists");
-        state
+        let _ = state
             .db
-            .add_relay_member(community.id, &owner.public_key().to_hex(), "owner", None)
+            .add_relay_member(
+                community.id,
+                &owner.public_key().to_hex(),
+                "owner",
+                None,
+                &nostr::Keys::generate(),
+            )
             .await
+            .map(|write| write.outcome)
             .expect("seed owner");
 
         for body in [
@@ -1071,8 +1077,15 @@ mod postgres_tests {
             .expect("community exists");
         state
             .db
-            .add_relay_member(community.id, &owner.public_key().to_hex(), "owner", None)
+            .add_relay_member(
+                community.id,
+                &owner.public_key().to_hex(),
+                "owner",
+                None,
+                &nostr::Keys::generate(),
+            )
             .await
+            .map(|write| write.outcome)
             .expect("seed owner");
         let before_delta_count = event_count(
             &state,
@@ -1211,9 +1224,15 @@ mod postgres_tests {
             .await
             .expect("lookup")
             .expect("community exists");
-        state
+        let _ = state
             .db
-            .add_relay_member(community.id, &owner.public_key().to_hex(), "owner", None)
+            .add_relay_member(
+                community.id,
+                &owner.public_key().to_hex(),
+                "owner",
+                None,
+                &nostr::Keys::generate(),
+            )
             .await
             .expect("seed owner");
 
@@ -1277,8 +1296,15 @@ mod postgres_tests {
         let community_id = community.id;
         state
             .db
-            .add_relay_member(community_id, &owner.public_key().to_hex(), "owner", None)
+            .add_relay_member(
+                community_id,
+                &owner.public_key().to_hex(),
+                "owner",
+                None,
+                &nostr::Keys::generate(),
+            )
             .await
+            .map(|write| write.outcome)
             .expect("seed owner");
 
         // Mint.
@@ -1358,8 +1384,15 @@ mod postgres_tests {
             .expect("community exists");
         state
             .db
-            .add_relay_member(community.id, &owner.public_key().to_hex(), "owner", None)
+            .add_relay_member(
+                community.id,
+                &owner.public_key().to_hex(),
+                "owner",
+                None,
+                &nostr::Keys::generate(),
+            )
             .await
+            .map(|write| write.outcome)
             .expect("seed owner");
 
         // Mint an invite.
@@ -1556,8 +1589,15 @@ mod postgres_tests {
         let community_id = community.id;
         state
             .db
-            .add_relay_member(community_id, &member.public_key().to_hex(), "member", None)
+            .add_relay_member(
+                community_id,
+                &member.public_key().to_hex(),
+                "member",
+                None,
+                &nostr::Keys::generate(),
+            )
             .await
+            .map(|write| write.outcome)
             .expect("seed member");
 
         for keys in [&member, &outsider] {
@@ -1622,8 +1662,15 @@ mod postgres_tests {
             .expect("community a");
         state
             .db
-            .add_relay_member(community_a.id, &owner.public_key().to_hex(), "owner", None)
+            .add_relay_member(
+                community_a.id,
+                &owner.public_key().to_hex(),
+                "owner",
+                None,
+                &nostr::Keys::generate(),
+            )
             .await
+            .map(|write| write.outcome)
             .expect("seed owner");
 
         let response = post_json(
@@ -1774,8 +1821,15 @@ mod postgres_tests {
             .expect("community exists");
         state
             .db
-            .add_relay_member(community.id, &owner.public_key().to_hex(), "owner", None)
+            .add_relay_member(
+                community.id,
+                &owner.public_key().to_hex(),
+                "owner",
+                None,
+                &nostr::Keys::generate(),
+            )
             .await
+            .map(|write| write.outcome)
             .expect("seed owner");
 
         // Mint a valid code so the replay under test is on the claim path.
@@ -2201,8 +2255,15 @@ mod postgres_tests {
             .expect("community exists");
         state
             .db
-            .add_relay_member(community.id, &owner.public_key().to_hex(), "owner", None)
+            .add_relay_member(
+                community.id,
+                &owner.public_key().to_hex(),
+                "owner",
+                None,
+                &nostr::Keys::generate(),
+            )
             .await
+            .map(|write| write.outcome)
             .expect("seed owner");
     }
 }
