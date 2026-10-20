@@ -126,12 +126,13 @@ impl ProvenCaller {
     /// of each raw filter are summarized; every other predicate (artifact
     /// or client-defined tags) only narrows the read, so it is dropped
     /// before parsing and cannot cancel the summary. A filter whose standard
-    /// dimensions do not parse leaves the line without a summary.
+    /// dimensions do not parse leaves the line without a summary. Skipped
+    /// below WARN, the level a failed or aborted request logs at.
     fn read_artifact(&self, raw: &[Value]) {
         const SUMMARIZED: [&str; 9] = [
             "kinds", "authors", "ids", "#h", "#p", "since", "until", "limit", "search",
         ];
-        if !tracing::enabled!(target: crate::access::TARGET, tracing::Level::INFO) {
+        if !tracing::enabled!(target: crate::access::TARGET, tracing::Level::WARN) {
             return;
         }
         let standard = |v: &Value| -> Value {
@@ -3292,6 +3293,36 @@ pub(crate) mod postgres_tests {
             buzz_core::CommunityId::from_uuid(uuid::Uuid::new_v4()),
             host,
         )
+    }
+
+    /// An artifact read's summary survives a WARN-only filter on a failed
+    /// request, without the search text or the artifact-only predicates.
+    #[test]
+    fn warn_only_artifact_read_lines_keep_the_filter_summary() {
+        let raw = [serde_json::json!({
+            "kinds": [9], "#h": [uuid::Uuid::nil().to_string()], "since": 10,
+            "search": "secret words", "#x": ["artifact"],
+        })];
+        let (_, out) = crate::access::tests::capture_warn(|| {
+            let caller = ProvenCaller {
+                pubkey: Keys::generate().public_key(),
+                event_id_bytes: fresh_nip98_event_id_bytes(),
+                signed_at: None,
+                slot: AccessSlot::default(),
+            };
+            caller.read_artifact(&raw);
+            caller.slot.emit("/query", 500);
+        });
+        assert!(!out.raw().contains("secret"), "{}", out.raw());
+        let lines = out.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert_eq!(line["level"], "WARN", "{line}");
+        assert_eq!(line["filters"], 1, "{line}");
+        assert_eq!(line["kinds"], "9", "{line}");
+        assert_eq!(line["channel_count"], 1, "{line}");
+        assert_eq!(line["since"], 10, "{line}");
+        assert_eq!(line["search"], true, "{line}");
     }
 
     fn fresh_nip98_event_id_bytes() -> [u8; 32] {

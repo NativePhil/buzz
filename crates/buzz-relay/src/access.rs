@@ -1070,9 +1070,10 @@ impl AccessSlot {
         checked
     }
 
-    /// Record the filters the request reads.
+    /// Record the filters the request reads. Built at WARN, not INFO,
+    /// because a denied, failed or aborted request logs its line at WARN.
     pub(crate) fn read(&self, filters: &[Filter]) {
-        if tracing::enabled!(target: TARGET, Level::INFO) {
+        if tracing::enabled!(target: TARGET, Level::WARN) {
             self.note().summary = Some(FilterSummary::new(filters));
         }
     }
@@ -1325,6 +1326,16 @@ pub(crate) mod tests {
         )
     }
 
+    /// Like [`capture`], with the access target filtered to WARN.
+    pub(crate) fn capture_warn<R>(f: impl FnOnce() -> R) -> (R, Captured) {
+        let _lock = crate::test_support::tracing_dispatch_lock();
+        let out = Captured::default();
+        let subscriber = json_subscriber(&out)
+            .with(tracing_subscriber::filter::Targets::new().with_target(TARGET, Level::WARN));
+        let r = tracing::subscriber::with_default(subscriber, f);
+        (r, out)
+    }
+
     /// Run `f` with JSON logs (flattened, as in production) captured.
     pub(crate) fn capture<R>(f: impl FnOnce() -> R) -> (R, Captured) {
         let _lock = crate::test_support::tracing_dispatch_lock();
@@ -1561,6 +1572,35 @@ pub(crate) mod tests {
         tracing::subscriber::with_default(subscriber, || {
             ReadLog::req(&conn, "s", &filters).error("database_error");
             ReadLog::count(&conn, "c", &filters).error("database_error");
+        });
+        assert!(!out.raw().contains("secret"), "{}", out.raw());
+        let lines = out.lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for line in &lines {
+            assert_eq!(line["level"], "WARN", "{line}");
+            assert_eq!(line["filters"], 1, "{line}");
+            assert_eq!(line["kinds"], "9", "{line}");
+            assert_eq!(line["channel_count"], 1, "{line}");
+            assert_eq!(line["since"], 10, "{line}");
+            assert_eq!(line["search"], true, "{line}");
+        }
+    }
+
+    /// HTTP lines that go to WARN keep the read's summary under a
+    /// WARN-only filter, without the search text.
+    #[test]
+    fn warn_only_http_read_lines_keep_the_filter_summary() {
+        let filters = [filter(serde_json::json!({
+            "kinds": [9], "#h": [Uuid::nil().to_string()], "since": 10,
+            "search": "secret words",
+        }))];
+        let (_, out) = capture_warn(|| {
+            let failed = AccessSlot::default();
+            failed.read(&filters);
+            failed.emit("/query", 500);
+            let aborted = AccessSlot::default();
+            aborted.read(&filters);
+            aborted.abandon("/query");
         });
         assert!(!out.raw().contains("secret"), "{}", out.raw());
         let lines = out.lines();
