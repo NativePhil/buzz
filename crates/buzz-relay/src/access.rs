@@ -194,18 +194,33 @@ pub(crate) struct RefusalBudget {
 impl RefusalBudget {
     /// Whether this refused read may write its line.
     pub(crate) fn read(&self) -> bool {
-        self.reads.fetch_add(1, Ordering::Relaxed) < REFUSAL_LINES
+        Self::charge(&self.reads)
     }
 
     /// Whether this post-decision AUTH frame may write its line.
     pub(crate) fn auth(&self) -> bool {
-        self.auths.fetch_add(1, Ordering::Relaxed) < REFUSAL_LINES
+        Self::charge(&self.auths)
     }
 
-    fn suppressed(seen: &AtomicU64) -> u64 {
-        seen.load(Ordering::Relaxed).saturating_sub(REFUSAL_LINES)
+    /// A charge logs while under budget, or once `close` has been written.
+    fn charge(seen: &AtomicU64) -> bool {
+        let prev = seen.fetch_add(1, Ordering::AcqRel);
+        prev < REFUSAL_LINES || prev >= CLOSED
+    }
+
+    /// Ends counting for `close` and returns how many were suppressed.
+    /// Swapping in [`CLOSED`] and every charge's `fetch_add` are
+    /// read-modify-writes on one atomic, so each charge lands either before
+    /// the swap (in `seen`) or after it (sees `CLOSED` and logs its own
+    /// line): none is both counted and logged, and none is lost.
+    fn close(seen: &AtomicU64) -> u64 {
+        seen.swap(CLOSED, Ordering::AcqRel)
+            .saturating_sub(REFUSAL_LINES)
     }
 }
+
+/// Counter value once `close` has been written.
+const CLOSED: u64 = 1 << 63;
 
 /// How a read ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -921,8 +936,8 @@ impl Drop for CloseLine {
             duration_ms = u64::try_from(self.opened.elapsed().as_millis()).unwrap_or(u64::MAX),
             events_queued = self.queued.events(),
             bytes_queued = self.queued.bytes(),
-            reads_suppressed = RefusalBudget::suppressed(&self.refusals.reads),
-            auth_suppressed = RefusalBudget::suppressed(&self.refusals.auths),
+            reads_suppressed = RefusalBudget::close(&self.refusals.reads),
+            auth_suppressed = RefusalBudget::close(&self.refusals.auths),
             "access"
         );
     }
@@ -1565,8 +1580,36 @@ pub(crate) mod tests {
         let budget = RefusalBudget::default();
         let logged = (0..20).filter(|_| budget.read()).count();
         assert_eq!(logged, 16);
-        assert_eq!(RefusalBudget::suppressed(&budget.reads), 4);
-        assert_eq!(RefusalBudget::suppressed(&budget.auths), 0);
+        assert_eq!(RefusalBudget::close(&budget.reads), 4);
+        assert_eq!(RefusalBudget::close(&budget.auths), 0);
+    }
+
+    /// Refusals charged after `close` was written each log their own line,
+    /// so every refusal is either counted on `close` or logged, never both.
+    #[test]
+    fn refusals_after_close_log_their_own_lines() {
+        let (late, out) = capture(|| {
+            let close = CloseLine::open(
+                Uuid::nil(),
+                CommunityId::from_uuid(Uuid::nil()),
+                "127.0.0.1:1".parse().unwrap(),
+                None,
+            );
+            let budget = Arc::clone(&close.refusals);
+            for _ in 0..(REFUSAL_LINES + 4) {
+                budget.read();
+                budget.auth();
+            }
+            drop(close);
+            let reads = (0..3).filter(|_| budget.read()).count();
+            let auths = (0..3).filter(|_| budget.auth()).count();
+            (reads, auths)
+        });
+        assert_eq!(late, (3, 3), "late refusals must each log");
+        let lines = out.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["reads_suppressed"], 4, "{}", lines[0]);
+        assert_eq!(lines[0]["auth_suppressed"], 4, "{}", lines[0]);
     }
 
     #[test]
