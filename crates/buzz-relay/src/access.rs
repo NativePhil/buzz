@@ -189,8 +189,6 @@ const REFUSAL_LINES: u64 = 16;
 pub(crate) struct RefusalBudget {
     reads: AtomicU64,
     auths: AtomicU64,
-    /// The connection's close line, so a detached read can keep it open.
-    close: std::sync::OnceLock<std::sync::Weak<CloseLine>>,
 }
 
 impl RefusalBudget {
@@ -202,12 +200,6 @@ impl RefusalBudget {
     /// Whether this post-decision AUTH frame may write its line.
     pub(crate) fn auth(&self) -> bool {
         self.auths.fetch_add(1, Ordering::Relaxed) < REFUSAL_LINES
-    }
-
-    /// Hold the close line until a detached read finishes, so refusals it
-    /// charges after the client leaves still reach `reads_suppressed`.
-    pub(crate) fn hold_close(&self) -> Option<Arc<CloseLine>> {
-        self.close.get().and_then(std::sync::Weak::upgrade)
     }
 
     fn suppressed(seen: &AtomicU64) -> u64 {
@@ -879,7 +871,7 @@ impl CloseLine {
         peer_addr: SocketAddr,
         client_ip: Option<IpAddr>,
     ) -> std::sync::Arc<Self> {
-        let line = std::sync::Arc::new(Self {
+        std::sync::Arc::new(Self {
             conn_id,
             community,
             peer_addr,
@@ -889,9 +881,7 @@ impl CloseLine {
             refused: std::sync::OnceLock::new(),
             queued: Default::default(),
             refusals: Default::default(),
-        });
-        let _ = line.refusals.close.set(Arc::downgrade(&line));
-        line
+        })
     }
 
     pub(crate) fn conn_id(&self) -> Uuid {
@@ -1568,30 +1558,6 @@ pub(crate) mod tests {
             assert_eq!(line["since"], 10, "{line}");
             assert_eq!(line["search"], true, "{line}");
         }
-    }
-
-    /// A detached read holding the close line past the connection's end
-    /// still has its late refusals counted on `close`.
-    #[test]
-    fn close_waits_for_held_reads_to_count_their_refusals() {
-        let (_, out) = capture(|| {
-            let close = CloseLine::open(
-                Uuid::nil(),
-                CommunityId::from_uuid(Uuid::nil()),
-                "127.0.0.1:1".parse().unwrap(),
-                None,
-            );
-            let budget = Arc::clone(&close.refusals);
-            let held = budget.hold_close();
-            drop(close);
-            for _ in 0..(REFUSAL_LINES + 4) {
-                budget.read();
-            }
-            drop(held);
-        });
-        let lines = out.lines();
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert_eq!(lines[0]["reads_suppressed"], 4, "{}", lines[0]);
     }
 
     #[test]
