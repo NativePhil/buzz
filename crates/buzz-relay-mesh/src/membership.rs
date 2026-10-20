@@ -9,7 +9,10 @@
 //! every gossip tick; a record whose heartbeat is older than the peer-record
 //! TTL belongs to a dead process. Such records are rejected on arrival, left
 //! out of digests, deltas, and dial candidates, and pruned from the table, so
-//! scuttlebutt can no longer keep a dead runtime alive fleet-wide.
+//! scuttlebutt can no longer keep a dead runtime alive fleet-wide. A peer we
+//! hold a live connection to is never pruned or hidden from routing: the
+//! transport itself proves the runtime is alive, and `remove_peer` downgrades
+//! it to `Disconnected` when that connection really closes.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,8 +31,12 @@ pub const DEFAULT_PHI_SUSPECT_THRESHOLD: f64 = 8.0;
 ///
 /// Live runtimes refresh every [`crate::runtime::DEFAULT_GOSSIP_INTERVAL`]
 /// (2s), and the ready registry expires a silent runtime after 45s. Five
-/// minutes sits well past both, so cross-pod clock skew and multi-hop gossip
-/// delay never expire a live runtime.
+/// minutes sits well past both, so multi-hop gossip delay and cross-pod clock
+/// skew *under the TTL* never expire a live runtime. A pod whose clock is
+/// behind by more than the TTL has all of its gossip rejected fleet-wide; it
+/// stays reachable through its Redis ready record and any live connection.
+/// `buzz_mesh_peer_records_expired_total{reason="rejected"}` that keeps
+/// climbing outside a rollout is the signal for that skew.
 pub const DEFAULT_PEER_RECORD_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Debug)]
@@ -98,6 +105,15 @@ impl MeshMembership {
     fn is_expired(&self, record: &GossipRecord, now_millis: u64) -> bool {
         let age = Duration::from_millis(now_millis.saturating_sub(record.heartbeat_millis));
         age > self.peer_record_ttl
+    }
+
+    /// Whether `peer` still belongs in the table: its heartbeat is fresh, or
+    /// we hold a live connection to it. Governs prune, admission, and
+    /// routing. Digests, deltas, and dials use [`Self::is_expired`] alone so a
+    /// stale heartbeat is never re-gossiped.
+    fn is_live(&self, peer: &PeerState, now_millis: u64) -> bool {
+        peer.connection_state == ConnectionState::Connected
+            || !self.is_expired(&peer.record, now_millis)
     }
 
     pub fn local_record(&self) -> GossipRecord {
@@ -228,7 +244,8 @@ impl MeshMembership {
         self.peers
             .read()
             .expect("membership lock poisoned")
-            .contains_key(&runtime_id)
+            .get(&runtime_id)
+            .is_some_and(|peer| self.is_live(peer, crate::gossip::now_millis()))
     }
 
     /// All live gossip records (local + unexpired peers), for reconcile/dial
@@ -252,7 +269,8 @@ impl MeshMembership {
         records
     }
 
-    /// Drop every peer whose heartbeat has expired. Returns how many went.
+    /// Drop every peer whose heartbeat has expired, except peers we are still
+    /// connected to. Returns how many went.
     pub fn prune_expired(&self) -> usize {
         self.prune_expired_at(crate::gossip::now_millis())
     }
@@ -260,7 +278,7 @@ impl MeshMembership {
     fn prune_expired_at(&self, now_millis: u64) -> usize {
         let mut peers = self.peers.write().expect("membership lock poisoned");
         let before = peers.len();
-        peers.retain(|_, peer| !self.is_expired(&peer.record, now_millis));
+        peers.retain(|_, peer| self.is_live(peer, now_millis));
         let pruned = before - peers.len();
         drop(peers);
         crate::telemetry::record_expired("pruned", pruned as u64);
@@ -436,10 +454,12 @@ impl MeshMembership {
 impl RelayMeshMembership for MeshMembership {
     fn peers(&self) -> Vec<PeerInfo> {
         let now = SystemTime::now();
+        let now_millis = crate::gossip::now_millis();
         self.peers
             .read()
             .expect("membership lock poisoned")
             .values()
+            .filter(|peer| self.is_live(peer, now_millis))
             .filter_map(|peer| {
                 let phi = peer.phi.phi_at(now);
                 if phi.is_some_and(|p| p >= self.phi_suspect_threshold) {
@@ -469,6 +489,7 @@ impl RelayMeshMembership for MeshMembership {
             .read()
             .expect("membership lock poisoned")
             .get(&runtime_id)
+            .filter(|peer| self.is_live(peer, crate::gossip::now_millis()))
             .is_some_and(|peer| peer.record.capabilities.iter().any(|c| c == capability))
     }
 }
@@ -597,6 +618,54 @@ mod tests {
         assert!(membership.has_peer(rid(2)));
         assert!(!membership.has_peer(rid(3)));
         assert_eq!(membership.prune_expired_at(later), 0);
+    }
+
+    #[test]
+    fn prune_keeps_a_connected_peer_with_a_stale_heartbeat() {
+        // A live connection whose gossip stopped arriving (control stream
+        // died, or the peer's clock is behind) must not be pruned: a Redis
+        // rescan would re-add it as `Disconnected` and nothing would restore
+        // `Connected`. Its stale record still stays out of digests and dials.
+        let membership = MeshMembership::new(record(1, 1, 0));
+        membership.apply_gossip_record(record(2, 1, 0));
+        membership.mark_connection_state(rid(2), ConnectionState::Connected);
+        let later = now_millis() + (TTL_SECS + 1) * 1_000;
+        assert_eq!(membership.prune_expired_at(later), 0);
+        assert!(membership.has_peer(rid(2)));
+        let status = membership.status();
+        assert_eq!(status.peers[0].connection_state, ConnectionState::Connected);
+        assert!(!membership
+            .records_at(later)
+            .iter()
+            .any(|r| r.runtime_id == rid(2)));
+        // Once the connection really closes, the next prune drops it.
+        membership.mark_connection_state(rid(2), ConnectionState::Disconnected);
+        assert_eq!(membership.prune_expired_at(later), 1);
+        assert!(!membership.has_peer(rid(2)));
+    }
+
+    #[test]
+    fn expired_unconnected_records_are_not_admitted_or_routed_before_prune() {
+        // Prune runs once per reconcile pass; a slow pass must not leave
+        // ghosts admissible or routable in between.
+        let ttl = Duration::from_millis(50);
+        let membership = MeshMembership::new(record(1, 1, 0)).with_peer_record_ttl(ttl);
+        membership.apply_gossip_record(record(2, 1, 0));
+        membership.apply_gossip_record(record(3, 1, 0));
+        membership.mark_connection_state(rid(3), ConnectionState::Connected);
+        std::thread::sleep(ttl * 3);
+        assert!(!membership.has_peer(rid(2)));
+        assert!(!membership.peer_has_capability(rid(2), "reliable-stream"));
+        let routed: Vec<_> = membership
+            .peers()
+            .into_iter()
+            .map(|p| p.runtime_id)
+            .collect();
+        assert!(!routed.contains(&rid(2)));
+        // The connected peer stays admitted and routable.
+        assert!(membership.has_peer(rid(3)));
+        assert!(membership.peer_has_capability(rid(3), "reliable-stream"));
+        assert!(routed.contains(&rid(3)));
     }
 
     #[test]

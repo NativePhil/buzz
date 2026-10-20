@@ -649,6 +649,13 @@ mod tests {
     }
 
     async fn runtime(key_byte: u8) -> (MeshRuntime, Vec<String>) {
+        runtime_with(key_byte, |membership| membership).await
+    }
+
+    async fn runtime_with(
+        key_byte: u8,
+        configure: impl FnOnce(MeshMembership) -> MeshMembership,
+    ) -> (MeshRuntime, Vec<String>) {
         let endpoint = MeshEndpoint::bind_with_secret_key(
             SecretKey::from_bytes(&[key_byte; 32]),
             loopback_any(),
@@ -666,7 +673,7 @@ mod tests {
             .collect();
         assert!(!addrs.is_empty(), "endpoint must expose a loopback addr");
         let record = GossipRecord::new(endpoint.runtime_id(), addrs.clone(), 1);
-        let membership = MeshMembership::new(record);
+        let membership = configure(MeshMembership::new(record));
         let rt = MeshRuntime::start_with_intervals(
             endpoint,
             membership,
@@ -987,6 +994,49 @@ mod tests {
         assert!(saw_candidates && saw_max_age);
         a.shutdown();
         b_accept.abort();
+    }
+
+    #[tokio::test]
+    async fn reconcile_pass_prunes_expired_peer_records() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let ttl = Duration::from_millis(100);
+        let (a, _) = runtime_with(7, |m| m.with_peer_record_ttl(ttl)).await;
+        // A dead runtime's record: draining, so no pass tries to dial it.
+        let mut ghost = GossipRecord::new(RuntimeId([9; 32]), vec!["127.0.0.1:9".into()], 1);
+        ghost.draining = true;
+        assert!(a.membership().apply_gossip_record(ghost));
+        assert!(a.membership().has_peer(RuntimeId([9; 32])));
+
+        tokio::time::sleep(ttl * 3).await;
+        a.reconcile_now().await;
+
+        assert!(
+            a.membership().status().peers.is_empty(),
+            "the reconcile pass must prune the expired record from the table"
+        );
+        let pruned: u64 = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(key, _, _, value)| {
+                let key = key.key();
+                let is_pruned = key.name() == telemetry::PEER_RECORDS_EXPIRED_TOTAL
+                    && key
+                        .labels()
+                        .any(|l| l.key() == "reason" && l.value() == "pruned");
+                match value {
+                    DebugValue::Counter(n) if is_pruned => Some(n),
+                    _ => None,
+                }
+            })
+            .sum();
+        assert!(pruned >= 1, "prune must count reason=\"pruned\"");
+        a.shutdown();
     }
 
     #[test]
