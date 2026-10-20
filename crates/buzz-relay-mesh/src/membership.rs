@@ -170,11 +170,17 @@ impl MeshMembership {
     /// A record learned here is a dial hint, not a connection: a new peer
     /// enters `Disconnected`, and an update never changes connection state.
     /// Only the runtime's real connect/disconnect paths do that.
+    ///
+    /// An existing entry that is no longer live (expired, not yet pruned, and
+    /// not connected) counts as absent: any fresh record replaces it whatever
+    /// its version, so a live peer's v1 Redis hint can re-admit it before the
+    /// next prune.
     pub fn apply_gossip_record(&self, record: GossipRecord) -> bool {
         if record.runtime_id == self.local_runtime_id {
             return false;
         }
-        if self.is_expired(&record, crate::gossip::now_millis()) {
+        let now_millis = crate::gossip::now_millis();
+        if self.is_expired(&record, now_millis) {
             crate::telemetry::record_expired("rejected", 1);
             return false;
         }
@@ -182,8 +188,16 @@ impl MeshMembership {
         let heartbeat = system_time_from_millis(record.heartbeat_millis);
         let mut peers = self.peers.write().expect("membership lock poisoned");
         match peers.get_mut(&record.runtime_id) {
-            Some(peer) if record.version <= peer.record.version => false,
+            Some(peer)
+                if self.is_live(peer, now_millis) && record.version <= peer.record.version =>
+            {
+                false
+            }
             Some(peer) => {
+                if !self.is_live(peer, now_millis) {
+                    // The old heartbeat history belongs to the dead stretch.
+                    peer.phi = PhiAccrual::default();
+                }
                 peer.record = record;
                 peer.phi.observe(heartbeat);
                 true
@@ -666,6 +680,22 @@ mod tests {
         assert!(membership.has_peer(rid(3)));
         assert!(membership.peer_has_capability(rid(3), "reliable-stream"));
         assert!(routed.contains(&rid(3)));
+    }
+
+    #[test]
+    fn a_fresh_record_replaces_an_expired_unpruned_entry_whatever_its_version() {
+        // A live peer whose stale entry outlived the TTL but not yet a prune
+        // must be re-admitted by its v1 Redis hint, or inbound from it is
+        // rejected until the next pass.
+        let ttl = Duration::from_millis(50);
+        let membership = MeshMembership::new(record(1, 1, 0)).with_peer_record_ttl(ttl);
+        assert!(membership.apply_gossip_record(record(2, 5, 0)));
+        std::thread::sleep(ttl * 3);
+        assert!(!membership.has_peer(rid(2)));
+        assert!(membership.apply_gossip_record(record(2, 1, 0)));
+        assert!(membership.has_peer(rid(2)));
+        // A live entry still keeps the version guard.
+        assert!(!membership.apply_gossip_record(record(2, 1, 0)));
     }
 
     #[test]
