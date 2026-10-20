@@ -47,6 +47,10 @@ class ChannelTypingNotifier extends Notifier<List<TypingEntry>> {
     final sessionState = ref.watch(relaySessionProvider);
     final generation = ++_generation;
     _activity.clear();
+    // Riverpod defers rebuilding a provider nobody is listening to until it
+    // is listened to or read again, and then skips onResume. So a build
+    // always means the channel is wanted.
+    _detached = false;
 
     ref.onCancel(() {
       _detachTimer?.cancel();
@@ -73,7 +77,7 @@ class ChannelTypingNotifier extends Notifier<List<TypingEntry>> {
       _stop();
     });
 
-    if (sessionState.status == SessionStatus.connected && !_detached) {
+    if (sessionState.status == SessionStatus.connected) {
       unawaited(_subscribeLive(generation));
     }
 

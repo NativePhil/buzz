@@ -123,6 +123,11 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
   @override
   AsyncValue<List<NostrEvent>> build() {
     final sessionState = ref.watch(relaySessionProvider);
+    // Riverpod defers rebuilding a provider nobody is listening to until it
+    // is listened to or read again, and then skips onResume. So a build
+    // always means the chat is wanted.
+    _hasListeners = true;
+    _liveDetached = false;
     ref.onCancel(() {
       _hasListeners = false;
       _deletionOwnerQueue.pause();
@@ -155,7 +160,7 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
       _clearSubscription();
     });
 
-    if (sessionState.status != SessionStatus.connected || _liveDetached) {
+    if (sessionState.status != SessionStatus.connected) {
       _initVersion++;
       _initInFlight = false;
       _initialWindowQueryInFlight = false;

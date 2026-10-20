@@ -1,4 +1,5 @@
 import 'package:buzz/features/channels/channel_messages_provider.dart';
+import 'package:buzz/features/channels/channel_typing_provider.dart';
 import 'package:buzz/features/channels/pending_local_messages_provider.dart';
 import 'package:buzz/features/channels/send_message_provider.dart';
 import 'package:buzz/shared/relay/relay.dart';
@@ -128,23 +129,43 @@ void main() {
         expect(timeline(), contains('after reconnect'));
         expect(timeline().where((text) => text == 'hello'), hasLength(1));
 
-        // A chat left for a while stops following live; returning shows the
-        // cached rows at once and catches up on what arrived meanwhile.
-        bool followsChannel() => relay.liveFilters.any(
+        // A chat left for a while stops following live, typing included;
+        // returning shows the cached rows at once and catches up on what
+        // arrived meanwhile.
+        bool follows({required bool typing}) => relay.liveFilters.any(
           (filters) => filters.any(
-            (filter) => (filter['#h'] as List?)?.contains(_channel) ?? false,
+            (filter) =>
+                ((filter['#h'] as List?)?.contains(_channel) ?? false) &&
+                (filter['kinds'] as List).contains(EventKind.typingIndicator) ==
+                    typing,
           ),
         );
+        bool followsChannel() =>
+            follows(typing: false) && follows(typing: true);
+        bool followsNothing() =>
+            !follows(typing: false) && !follows(typing: true);
+        var typing = container.listen(
+          channelTypingProvider(_channel),
+          (_, _) {},
+        );
+        settle();
+        expect(followsChannel(), isTrue);
         messages.close();
+        typing.close();
         async.elapse(const Duration(seconds: 29));
         expect(followsChannel(), isTrue, reason: 'a brief cover keeps it');
         async.elapse(const Duration(seconds: 2));
-        expect(followsChannel(), isFalse);
+        expect(followsNothing(), isTrue);
+        // A reconnect while it's hidden must not strand it detached.
+        relay.drop();
+        async.elapse(const Duration(seconds: 2));
+        expect(followsNothing(), isTrue);
         relay.deliver(message('while away', liveSince() + 1));
         messages = container.listen(
           channelMessagesProvider(_channel),
           (_, _) {},
         );
+        typing = container.listen(channelTypingProvider(_channel), (_, _) {});
         expect(timeline(), contains('after reconnect'));
         settle();
         expect(followsChannel(), isTrue);
