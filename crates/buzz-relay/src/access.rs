@@ -205,7 +205,7 @@ impl RefusalBudget {
     /// A charge logs while under budget, or once `close` has been written.
     fn charge(seen: &AtomicU64) -> bool {
         let prev = seen.fetch_add(1, Ordering::AcqRel);
-        prev < REFUSAL_LINES || prev >= CLOSED
+        !(REFUSAL_LINES..CLOSED).contains(&prev)
     }
 
     /// Ends counting for `close` and returns how many were suppressed.
