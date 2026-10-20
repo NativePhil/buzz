@@ -1551,25 +1551,13 @@ pub(crate) mod tests {
     /// filter summary, and never the search text.
     #[test]
     fn warn_only_error_lines_keep_the_filter_summary() {
-        use tracing_subscriber::layer::SubscriberExt;
         let (conn, _rx) =
             crate::connection::tests::test_conn_with_auth(crate::connection::AuthState::Failed);
         let filters = [filter(serde_json::json!({
             "kinds": [9], "#h": [Uuid::nil().to_string()], "since": 10,
             "search": "secret words",
         }))];
-        let out = Captured::default();
-        let writer = out.clone();
-        let subscriber = tracing_subscriber::registry()
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .json()
-                    .flatten_event(true)
-                    .with_writer(move || writer.clone()),
-            )
-            .with(tracing_subscriber::filter::Targets::new().with_target(TARGET, Level::WARN));
-        let _lock = crate::test_support::tracing_dispatch_lock();
-        tracing::subscriber::with_default(subscriber, || {
+        let (_, out) = capture_warn(|| {
             ReadLog::req(&conn, "s", &filters).error("database_error");
             ReadLog::count(&conn, "c", &filters).error("database_error");
         });
