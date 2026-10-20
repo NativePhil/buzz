@@ -694,6 +694,9 @@ mod tests {
         assert!(!membership.has_peer(rid(2)));
         assert!(membership.apply_gossip_record(record(2, 1, 0)));
         assert!(membership.has_peer(rid(2)));
+        // The dead gap is not kept as a phi sample: one fresh observation
+        // and no intervals reads as no suspicion yet.
+        assert_eq!(membership.status().peers[0].phi, None);
         // A live entry still keeps the version guard.
         assert!(!membership.apply_gossip_record(record(2, 1, 0)));
     }
