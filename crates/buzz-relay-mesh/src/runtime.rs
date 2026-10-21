@@ -1194,7 +1194,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn connection_closed_during_install_ends_disconnected_and_expires() {
+    // Installs an already-closed connection and checks the peer ends
+    // Disconnected and then expires. This does not deterministically hit the
+    // close-between-insert-and-state-write window inside install_peer; the
+    // reconcile re-sync (reconcile_pass_resyncs_connection_state_from_transport)
+    // is what guarantees a stale Connected flag cannot outlive that race.
+    async fn installing_closed_connection_ends_disconnected_and_expires() {
         let ttl = Duration::from_millis(300);
         let (a, _) = runtime_with(13, |m| m.with_peer_record_ttl(ttl), QUIET).await;
         let (b, b_addrs, b_accept) = accepting_endpoint(14, true).await;
