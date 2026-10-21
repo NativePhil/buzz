@@ -256,27 +256,38 @@ fn install_peer(inner: &Arc<Inner>, peer: MeshPeer, dialed_by_us: bool) -> bool 
             tasks,
         },
     );
-    drop(peers);
+    // Still under the peers lock: a receive task that sees this connection
+    // close must wait for it, so its `Disconnected` lands after `Connected`.
     inner
         .membership
         .mark_connection_state(remote, ConnectionState::Connected);
+    drop(peers);
     tracing::info!(peer = %remote, dialed_by_us, "mesh: peer connected");
     true
 }
 
 fn remove_peer(inner: &Inner, runtime_id: RuntimeId) {
-    if let Some(entry) = inner
-        .peers
-        .write()
-        .expect("peer lock poisoned")
-        .remove(&runtime_id)
-    {
+    let mut peers = inner.peers.write().expect("peer lock poisoned");
+    if let Some(entry) = peers.remove(&runtime_id) {
         entry.abort();
         inner
             .membership
             .mark_connection_state(runtime_id, ConnectionState::Disconnected);
+        drop(peers);
         tracing::info!(peer = %runtime_id, "mesh: peer disconnected");
     }
+}
+
+/// Write a dial's `state` unless a connection to `runtime_id` is installed
+/// (an inbound accept can land while our dial is pending). Returns whether
+/// it wrote. Holding the peers lock orders it against install/remove.
+fn mark_dial_state(inner: &Inner, runtime_id: RuntimeId, state: ConnectionState) -> bool {
+    let peers = inner.peers.read().expect("peer lock poisoned");
+    if peers.contains_key(&runtime_id) {
+        return false;
+    }
+    inner.membership.mark_connection_state(runtime_id, state);
+    true
 }
 
 async fn accept_loop(inner: Arc<Inner>) {
@@ -329,6 +340,12 @@ async fn reconcile_loop(inner: Arc<Inner>) {
 
 async fn reconcile_once(inner: &Arc<Inner>) {
     let started = Instant::now();
+    {
+        let peers = inner.peers.read().expect("peer lock poisoned");
+        inner
+            .membership
+            .sync_connection_states(|runtime_id| peers.contains_key(&runtime_id));
+    }
     let pruned = inner.membership.prune_expired();
     if pruned > 0 {
         tracing::info!(pruned, "mesh: pruned expired peer records");
@@ -342,57 +359,59 @@ async fn reconcile_once(inner: &Arc<Inner>) {
     }
     inner.membership.publish_table_metrics();
 
-    let local = inner.endpoint.runtime_id();
-    let candidates: Vec<_> = {
-        let peers = inner.peers.read().expect("peer lock poisoned");
-        inner
-            .membership
-            .records()
-            .into_iter()
-            .filter(|record| {
-                record.runtime_id != local
-                    && !record.draining
-                    && !peers.contains_key(&record.runtime_id)
-            })
-            .collect()
-    };
+    let candidates = dial_candidates(inner);
     metrics::gauge!(telemetry::RECONCILE_CANDIDATES).set(candidates.len() as f64);
-
-    for record in candidates {
-        // A connection can land mid-pass (inbound accept, or an earlier dial's
-        // tie-break), so recheck before each dial.
-        let already_connected = inner
-            .peers
-            .read()
-            .expect("peer lock poisoned")
-            .contains_key(&record.runtime_id);
-        if already_connected {
-            continue;
-        }
-        dial_peer(inner, &record).await;
+    for runtime_id in candidates {
+        dial_peer(inner, runtime_id).await;
     }
     metrics::histogram!(telemetry::RECONCILE_PASS_SECONDS).record(started.elapsed().as_secs_f64());
 }
 
-async fn dial_peer(inner: &Arc<Inner>, record: &crate::gossip::GossipRecord) {
+/// Unconnected, non-draining, unexpired peers, snapshotted at pass start.
+fn dial_candidates(inner: &Inner) -> Vec<RuntimeId> {
+    let local = inner.endpoint.runtime_id();
+    let peers = inner.peers.read().expect("peer lock poisoned");
+    inner
+        .membership
+        .records()
+        .into_iter()
+        .filter(|record| {
+            record.runtime_id != local
+                && !record.draining
+                && !peers.contains_key(&record.runtime_id)
+        })
+        .map(|record| record.runtime_id)
+        .collect()
+}
+
+/// Dial `runtime_id`'s addresses in turn. Each dial can take a minute against
+/// a dead runtime, so before every attempt this re-reads the record and stops
+/// once it has expired or started draining, or a connection has landed
+/// (inbound accept, or a tie-break).
+async fn dial_peer(inner: &Arc<Inner>, runtime_id: RuntimeId) {
+    let Some(record) = inner.membership.dial_record(runtime_id) else {
+        return;
+    };
     for addr in &record.endpoint_addrs {
+        if inner.membership.dial_record(runtime_id).is_none()
+            || !mark_dial_state(inner, runtime_id, ConnectionState::Connecting)
+        {
+            break;
+        }
         let sock = match addr.parse() {
             Ok(sock) => sock,
             Err(err) => {
-                tracing::warn!(peer = %record.runtime_id, addr, %err, "mesh: bad peer addr");
+                tracing::warn!(peer = %runtime_id, addr, %err, "mesh: bad peer addr");
                 continue;
             }
         };
-        let endpoint_addr = match direct_addr(record.runtime_id, sock) {
+        let endpoint_addr = match direct_addr(runtime_id, sock) {
             Ok(ea) => ea,
             Err(err) => {
-                tracing::warn!(peer = %record.runtime_id, %err, "mesh: bad peer id");
-                return;
+                tracing::warn!(peer = %runtime_id, %err, "mesh: bad peer id");
+                break;
             }
         };
-        inner
-            .membership
-            .mark_connection_state(record.runtime_id, ConnectionState::Connecting);
         let started = Instant::now();
         let result = inner.endpoint.connect(endpoint_addr).await;
         telemetry::record_dial(result.is_ok(), started.elapsed());
@@ -402,13 +421,11 @@ async fn dial_peer(inner: &Arc<Inner>, record: &crate::gossip::GossipRecord) {
                 return;
             }
             Err(err) => {
-                tracing::warn!(peer = %record.runtime_id, addr, %err, "mesh: dial failed");
+                tracing::warn!(peer = %runtime_id, addr, %err, "mesh: dial failed");
             }
         }
     }
-    inner
-        .membership
-        .mark_connection_state(record.runtime_id, ConnectionState::Disconnected);
+    mark_dial_state(inner, runtime_id, ConnectionState::Disconnected);
 }
 
 async fn datagram_recv_loop(inner: Arc<Inner>, peer: MeshPeer) {
@@ -648,13 +665,19 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
     }
 
+    const RECONCILE_INTERVAL: Duration = Duration::from_millis(200);
+    /// Long enough that the background reconcile loop never runs a second
+    /// pass during a test, so the test drives every dial and state sync.
+    const QUIET: Duration = Duration::from_secs(3600);
+
     async fn runtime(key_byte: u8) -> (MeshRuntime, Vec<String>) {
-        runtime_with(key_byte, |membership| membership).await
+        runtime_with(key_byte, |membership| membership, RECONCILE_INTERVAL).await
     }
 
     async fn runtime_with(
         key_byte: u8,
         configure: impl FnOnce(MeshMembership) -> MeshMembership,
+        reconcile_interval: Duration,
     ) -> (MeshRuntime, Vec<String>) {
         let endpoint = MeshEndpoint::bind_with_secret_key(
             SecretKey::from_bytes(&[key_byte; 32]),
@@ -679,9 +702,61 @@ mod tests {
             membership,
             None,
             Duration::from_millis(100),
-            Duration::from_millis(200),
+            reconcile_interval,
         );
         (rt, addrs)
+    }
+
+    /// A bare endpoint (no runtime) that accepts every dial. `drop_accepted`
+    /// closes each connection as soon as it lands; otherwise they are held.
+    async fn accepting_endpoint(
+        key_byte: u8,
+        drop_accepted: bool,
+    ) -> (MeshEndpoint, Vec<String>, JoinHandle<()>) {
+        let endpoint = MeshEndpoint::bind_with_secret_key(
+            SecretKey::from_bytes(&[key_byte; 32]),
+            loopback_any(),
+        )
+        .await
+        .unwrap();
+        let addrs = endpoint.ip_addrs().iter().map(|s| s.to_string()).collect();
+        let accept = tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move {
+                let mut held = Vec::new();
+                while let Ok(Some(peer)) = endpoint.accept().await {
+                    if !drop_accepted {
+                        held.push(peer);
+                    }
+                }
+            }
+        });
+        (endpoint, addrs, accept)
+    }
+
+    fn state_of(rt: &MeshRuntime, runtime_id: RuntimeId) -> Option<ConnectionState> {
+        rt.membership()
+            .status()
+            .peers
+            .into_iter()
+            .find(|peer| peer.runtime_id == runtime_id.to_string())
+            .map(|peer| peer.connection_state)
+    }
+
+    fn dial_count(snapshotter: &metrics_util::debugging::Snapshotter) -> u64 {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(key, _, _, value)| match value {
+                metrics_util::debugging::DebugValue::Counter(n)
+                    if key.key().name() == telemetry::DIAL_TOTAL =>
+                {
+                    Some(n)
+                }
+                _ => None,
+            })
+            .sum()
     }
 
     /// Seed b's record into a's membership so a dials b.
@@ -1005,7 +1080,7 @@ mod tests {
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let ttl = Duration::from_millis(100);
-        let (a, _) = runtime_with(7, |m| m.with_peer_record_ttl(ttl)).await;
+        let (a, _) = runtime_with(7, |m| m.with_peer_record_ttl(ttl), RECONCILE_INTERVAL).await;
         // A dead runtime's record: draining, so no pass tries to dial it.
         let mut ghost = GossipRecord::new(RuntimeId([9; 32]), vec!["127.0.0.1:9".into()], 1);
         ghost.draining = true;
@@ -1037,6 +1112,153 @@ mod tests {
             .sum();
         assert!(pruned >= 1, "prune must count reason=\"pruned\"");
         a.shutdown();
+    }
+
+    #[tokio::test]
+    async fn dial_skips_candidate_that_expired_after_the_pass_snapshot() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let ttl = Duration::from_millis(300);
+        let (a, _) = runtime_with(11, |m| m.with_peer_record_ttl(ttl), QUIET).await;
+        let (b, b_addrs, b_accept) = accepting_endpoint(12, false).await;
+        let b_id = b.runtime_id();
+        // Let the background loop's startup pass finish (empty table), so
+        // every dial below is one this test made.
+        timeout(Duration::from_secs(5), async {
+            while !snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .any(|(key, _, _, _)| key.key().name() == telemetry::RECONCILE_PASS_SECONDS)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("startup reconcile pass should run");
+        a.membership()
+            .apply_gossip_record(GossipRecord::new(b_id, b_addrs.clone(), 1));
+
+        let candidates = dial_candidates(&a.inner);
+        assert_eq!(candidates, vec![b_id]);
+        // Stands in for earlier dials in the same pass: b's record expires
+        // while the pass is still working through its snapshot.
+        tokio::time::sleep(ttl * 2).await;
+        for runtime_id in candidates {
+            dial_peer(&a.inner, runtime_id).await;
+        }
+        assert_eq!(
+            dial_count(&snapshotter),
+            0,
+            "an expired candidate must not be dialed"
+        );
+        assert!(a.connected_peers().is_empty());
+
+        // Control: the same address dials fine once b's record is fresh.
+        a.membership()
+            .apply_gossip_record(GossipRecord::new(b_id, b_addrs, 2));
+        dial_peer(&a.inner, b_id).await;
+        assert_eq!(a.connected_peers(), vec![b_id]);
+        assert_eq!(state_of(&a, b_id), Some(ConnectionState::Connected));
+        a.shutdown();
+        b_accept.abort();
+    }
+
+    #[tokio::test]
+    async fn finishing_dial_does_not_overwrite_a_connection_that_landed() {
+        let (a, b) = connected_pair().await;
+        let b_id = b.local_runtime_id();
+        assert_eq!(state_of(&a, b_id), Some(ConnectionState::Connected));
+
+        // A dial that was pending when the connection landed ends with a
+        // failure write; it must not clobber the live connection's state.
+        assert!(!mark_dial_state(
+            &a.inner,
+            b_id,
+            ConnectionState::Disconnected
+        ));
+        assert!(!mark_dial_state(
+            &a.inner,
+            b_id,
+            ConnectionState::Connecting
+        ));
+        dial_peer(&a.inner, b_id).await;
+        assert_eq!(state_of(&a, b_id), Some(ConnectionState::Connected));
+        assert_eq!(a.connected_peers(), vec![b_id]);
+        a.shutdown();
+        b.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connection_closed_during_install_ends_disconnected_and_expires() {
+        let ttl = Duration::from_millis(300);
+        let (a, _) = runtime_with(13, |m| m.with_peer_record_ttl(ttl), QUIET).await;
+        let (b, b_addrs, b_accept) = accepting_endpoint(14, true).await;
+        let b_id = b.runtime_id();
+        // Draining, as in a rollout: no reconcile pass dials it, so nothing
+        // but the connection state stands between it and expiry.
+        let mut record = GossipRecord::new(b_id, b_addrs.clone(), 1);
+        record.draining = true;
+        a.membership().apply_gossip_record(record);
+
+        let sock = b_addrs[0].parse().unwrap();
+        let peer = a
+            .inner
+            .endpoint
+            .connect(direct_addr(b_id, sock).unwrap())
+            .await
+            .unwrap();
+        // b drops the connection; wait until a's side has observed the close,
+        // so the receive tasks install_peer spawns fail straight away.
+        timeout(Duration::from_secs(5), peer.recv_datagram())
+            .await
+            .expect("b should close the connection")
+            .expect_err("closed connection yields no datagram");
+        install_peer(&a.inner, peer, true);
+
+        timeout(Duration::from_secs(5), async {
+            while !a.connected_peers().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the closed connection must be removed");
+        assert_eq!(state_of(&a, b_id), Some(ConnectionState::Disconnected));
+
+        // Without a stale Connected flag, the TTL exemption does not apply.
+        tokio::time::sleep(ttl * 2).await;
+        assert_eq!(a.membership().prune_expired(), 1);
+        assert_eq!(state_of(&a, b_id), None);
+        a.shutdown();
+        b_accept.abort();
+    }
+
+    #[tokio::test]
+    async fn reconcile_pass_resyncs_connection_state_from_transport() {
+        let (a, b) = connected_pair().await;
+        let b_id = b.local_runtime_id();
+        let mut ghost = GossipRecord::new(RuntimeId([9; 32]), vec!["127.0.0.1:9".into()], 1);
+        ghost.draining = true;
+        assert!(a.membership().apply_gossip_record(ghost));
+
+        // Simulate writes the event-driven paths missed, in both directions.
+        a.membership()
+            .mark_connection_state(b_id, ConnectionState::Disconnected);
+        a.membership()
+            .mark_connection_state(RuntimeId([9; 32]), ConnectionState::Connected);
+        a.reconcile_now().await;
+
+        assert_eq!(state_of(&a, b_id), Some(ConnectionState::Connected));
+        assert_eq!(
+            state_of(&a, RuntimeId([9; 32])),
+            Some(ConnectionState::Disconnected)
+        );
+        a.shutdown();
+        b.shutdown();
     }
 
     #[test]

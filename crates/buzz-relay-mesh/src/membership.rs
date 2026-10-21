@@ -9,10 +9,13 @@
 //! every gossip tick; a record whose heartbeat is older than the peer-record
 //! TTL belongs to a dead process. Such records are rejected on arrival, left
 //! out of digests, deltas, and dial candidates, and pruned from the table, so
-//! scuttlebutt can no longer keep a dead runtime alive fleet-wide. A peer we
-//! hold a live connection to is never pruned or hidden from routing: the
-//! transport itself proves the runtime is alive, and `remove_peer` downgrades
-//! it to `Disconnected` when that connection really closes.
+//! scuttlebutt can no longer keep a dead runtime alive fleet-wide. The TTL
+//! never prunes or hides a peer we hold a live connection to: the transport
+//! itself proves the runtime is alive. (Phi suspicion still filters it from
+//! [`RelayMeshMembership::peers`] once its gossip stalls.) The runtime keeps
+//! `Connected` in step with its transport map, writing it under the map's lock
+//! and re-syncing it every reconcile pass, so a closed connection cannot leave
+//! a dead runtime exempt from expiry.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -218,6 +221,36 @@ impl MeshMembership {
                     },
                 );
                 true
+            }
+        }
+    }
+
+    /// The current record for `runtime_id` if it is still worth dialing:
+    /// present, unexpired, and not draining. Dials re-read this before every
+    /// attempt, because a reconcile pass's candidate snapshot goes stale while
+    /// earlier dials are pending.
+    pub fn dial_record(&self, runtime_id: RuntimeId) -> Option<GossipRecord> {
+        let now_millis = crate::gossip::now_millis();
+        self.peers
+            .read()
+            .expect("membership lock poisoned")
+            .get(&runtime_id)
+            .filter(|peer| !peer.record.draining && !self.is_expired(&peer.record, now_millis))
+            .map(|peer| peer.record.clone())
+    }
+
+    /// Re-derive `Connected` from the transport: a peer in `connected` is
+    /// `Connected`; a `Connected` peer missing from it is `Disconnected`.
+    /// `Connecting` is left alone. Heals any write the event-driven updates
+    /// missed (for example a connection installed after its record was pruned
+    /// and later re-learned from gossip).
+    pub(crate) fn sync_connection_states(&self, connected: impl Fn(RuntimeId) -> bool) {
+        let mut peers = self.peers.write().expect("membership lock poisoned");
+        for (runtime_id, peer) in peers.iter_mut() {
+            if connected(*runtime_id) {
+                peer.connection_state = ConnectionState::Connected;
+            } else if peer.connection_state == ConnectionState::Connected {
+                peer.connection_state = ConnectionState::Disconnected;
             }
         }
     }
