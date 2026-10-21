@@ -29,7 +29,7 @@ void main() {
         relay.seed([message('first', now - 20), message('second', now - 10)]);
 
         // History must not wait on the live subscription's EOSE.
-        final eose = relay.holdEose();
+        final admitted = relay.holdReq();
         final container = ProviderContainer(overrides: relay.overrides);
         addTearDown(container.dispose);
         var messages = container.listen(
@@ -65,8 +65,12 @@ void main() {
         );
         expect(timeline(), ['first', 'second']);
         expect(relay.queries, hasLength(1), reason: 'read the channel window');
-        eose.complete();
+        // A message signed just before the chat opened, committed after the
+        // window read but before the relay admits the live REQ, still arrives.
+        relay.seed([message('signed as it opened', now - 1)]);
+        admitted.complete();
         settle();
+        expect(timeline(), contains('signed as it opened'));
         expect(
           relay.reqs.where((req) => (req[1] as String).startsWith('h-')),
           isEmpty,

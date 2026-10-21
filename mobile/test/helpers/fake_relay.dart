@@ -40,7 +40,7 @@ class FakeRelay {
   final _rejections = <({bool Function(NostrEvent) match, String message})>[];
   Completer<void>? _okHold;
   Completer<void>? _echoHold;
-  Completer<void>? _eoseHold;
+  Completer<void>? _reqHold;
   Completer<void>? _authHold;
   final DateTime Function()? _now;
 
@@ -98,9 +98,10 @@ class FakeRelay {
   /// The relay dispatches after commit, so echo and OK have no fixed order.
   Completer<void> holdEcho() => _echoHold = Completer<void>();
 
-  /// Withholds stored replay and EOSE for new REQs until the completer
-  /// completes, as a slow relay would.
-  Completer<void> holdEose() => _eoseHold = Completer<void>();
+  /// Holds new REQs until the completer completes, as a relay's access checks
+  /// would: they read stored events, start live fan-out and reach EOSE only
+  /// once admitted. Events committed meanwhile reach them only through replay.
+  Completer<void> holdReq() => _reqHold = Completer<void>();
 
   /// Keeps the next connection unauthenticated until the completer completes.
   /// Like the relay, it answers a REQ sent before AUTH with CLOSED.
@@ -151,20 +152,21 @@ class FakeRelay {
         }
         reqs.add(message);
         final filters = message.skip(2).cast<Map<String, dynamic>>().toList();
-        final history = _query(filters);
-        if (history == null) return;
-        socket._live[subId] = filters;
-        void replay() {
-          for (final event in history) {
-            socket._reply(['EVENT', subId, event.toJson()]);
-          }
-          socket._reply(['EOSE', subId]);
+        void admit() {
+          if (!socket._authenticated) return;
+          final history = _query(filters);
+          if (history == null) return;
+          socket._live[subId] = filters;
+          scheduleMicrotask(() {
+            for (final event in history) {
+              socket._reply(['EVENT', subId, event.toJson()]);
+            }
+            socket._reply(['EOSE', subId]);
+          });
         }
 
-        final hold = _eoseHold;
-        hold == null
-            ? scheduleMicrotask(replay)
-            : hold.future.then((_) => replay());
+        final hold = _reqHold;
+        hold == null ? admit() : hold.future.then((_) => admit());
       case 'CLOSE':
         socket._live.remove(message[1]);
       case 'EVENT':

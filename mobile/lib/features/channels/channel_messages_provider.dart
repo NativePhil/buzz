@@ -23,6 +23,12 @@ const _maxCachedReplies = 2048;
 /// such as a profile pushed over the chat, returns without a catch-up fetch.
 const _liveDetachDelay = Duration(seconds: 30);
 
+/// How far back the live subscription opens, the same skew reconnect replay
+/// uses. The relay admits a REQ only after its access checks, so a message
+/// signed just before the chat opened can commit after the window read but
+/// before the subscription exists; replay from a little earlier covers it.
+const _liveOverlapSeconds = 5;
+
 const _channelLiveEventKinds = [
   ...EventKind.channelEventKinds,
   EventKind.channelThreadSummary,
@@ -197,9 +203,9 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
     try {
       final session = ref.read(relaySessionProvider.notifier);
 
-      // The live REQ goes out before history is requested, and its `since`
-      // replays anything stored from now on, so the two overlap without
-      // history waiting a round trip for the subscription's EOSE.
+      // History doesn't wait a round trip for the live subscription's EOSE.
+      // The two overlap because the subscription replays from a few seconds
+      // back; duplicates merge by id.
       unawaited(
         session
             .subscribe(
@@ -208,7 +214,7 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
                 tags: {
                   '#h': [channelId],
                 },
-                since: _currentUnixSeconds(),
+                since: _currentUnixSeconds() - _liveOverlapSeconds,
                 limit: 200,
               ),
               _handleLiveEvent,
