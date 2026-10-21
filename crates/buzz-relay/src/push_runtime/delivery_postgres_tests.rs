@@ -22,51 +22,54 @@ async fn idle_delivery_worker_does_not_admit_empty_communities() {
         .unwrap()
         .push_enabled = true;
 
-    let recorder = DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
-    let _guard = metrics::set_default_local_recorder(&recorder);
-    // The real worker, real database, and real backoff: idle checks at 0, 0.5,
-    // and 1.5 seconds. Slower machines may complete fewer checks, never more.
-    assert!(tokio::time::timeout(
-        Duration::from_millis(1800),
-        run_delivery_worker(state.clone()),
-    )
-    .await
-    .is_err());
-    state.begin_shutdown();
+    for workers in [1, 4] {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        // The real worker, real database, and real backoff: idle checks at 0, 0.5,
+        // and 1.5 seconds. Slower machines may complete fewer checks, never more.
+        assert!(tokio::time::timeout(
+            Duration::from_millis(1800),
+            futures::future::join_all((0..workers).map(|_| run_delivery_worker(state.clone()))),
+        )
+        .await
+        .is_err());
 
-    let snapshot = snapshotter.snapshot().into_vec();
-    let mut discoveries = 0;
-    let mut admissions = 0;
-    for (key, _, _, value) in snapshot {
-        let DebugValue::Counter(count) = value else {
-            continue;
-        };
-        if key.key().name() == "buzz_db_pool_acquire_attempts_total"
-            && key
-                .key()
-                .labels()
-                .any(|label| label.key() == "operation" && label.value() == "maintenance")
-        {
-            discoveries += count;
+        let snapshot = snapshotter.snapshot().into_vec();
+        let mut discoveries = 0;
+        let mut admissions = 0;
+        for (key, _, _, value) in snapshot {
+            let DebugValue::Counter(count) = value else {
+                continue;
+            };
+            if key.key().name() == "buzz_db_pool_acquire_attempts_total"
+                && key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "operation" && label.value() == "maintenance")
+            {
+                discoveries += count;
+            }
+            if key.key().name() == "buzz_db_advisory_lock_acquisitions_total"
+                && key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "lock_type" && label.value() == "deletion")
+            {
+                admissions += count;
+            }
         }
-        if key.key().name() == "buzz_db_advisory_lock_acquisitions_total"
-            && key
-                .key()
-                .labels()
-                .any(|label| label.key() == "lock_type" && label.value() == "deletion")
-        {
-            admissions += count;
-        }
+        assert_eq!(
+            admissions, 0,
+            "idle communities must not open claim transactions"
+        );
+        assert!(
+            (workers..=3 * workers).contains(&discoveries),
+            "idle polling stays bounded: {discoveries}"
+        );
+        eprintln!("{workers} workers, 1,000 empty communities, 1.8s: {discoveries} discovery reads, {admissions} claim admissions");
     }
-    assert_eq!(
-        admissions, 0,
-        "idle communities must not open claim transactions"
-    );
-    assert!(
-        (1..=3).contains(&discoveries),
-        "idle polling stays bounded: {discoveries}"
-    );
+    state.begin_shutdown();
 }
 
 #[tokio::test]

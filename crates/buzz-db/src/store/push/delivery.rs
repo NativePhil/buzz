@@ -1,7 +1,7 @@
 use super::*;
 
-// Keep the per-community due/recovery indexes usable. EXISTS stops at the first
-// eligible wake; filtering before LIMIT prevents invalid jobs starving live work.
+// Use the existing due/recovery indexes. Filtering before LIMIT prevents
+// invalid jobs from starving live work.
 const DUE_COMMUNITIES_SQL: &str = r#"
     SELECT c.id
     FROM communities c

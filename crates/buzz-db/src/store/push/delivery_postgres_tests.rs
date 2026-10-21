@@ -220,3 +220,78 @@ async fn invalid_backlog_cannot_hide_ready_communities() {
     }
     eprintln!("10 discoveries with 1,136 communities, 128 invalid jobs, 27,200 terminal jobs, 8 ready jobs: {:?}", started.elapsed());
 }
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn concurrent_discovery_preserves_exclusive_claims_and_recovery_fencing() {
+    let pool = PgPool::connect(&crate::test_support::database_url())
+        .await
+        .unwrap();
+    let community = make_community(&pool).await;
+    activate(&pool, community, &[41; 32], "install", &[42; 32], 1).await;
+    for n in 0..32 {
+        enqueue_one(&pool, community, &[41; 32], &[n; 32], 1).await;
+    }
+    // Discovery is deliberately not exclusive: both workers can see the same
+    // candidate, while the existing claim transaction owns exclusivity.
+    let (a, b) = tokio::join!(
+        due_wake_communities(&pool, None),
+        due_wake_communities(&pool, None)
+    );
+    assert_eq!(a.unwrap(), vec![community]);
+    assert_eq!(b.unwrap(), vec![community]);
+    let until = Utc::now() + chrono::Duration::seconds(30);
+    let (a, b) = tokio::join!(
+        claim_due_wakes(&pool, community, 16, until),
+        claim_due_wakes(&pool, community, 16, until),
+    );
+    let mut claims = a.unwrap();
+    claims.extend(b.unwrap());
+    assert_eq!(claims.len(), 32);
+    assert_eq!(
+        claims
+            .iter()
+            .map(|wake| wake.id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        32
+    );
+    assert!(due_wake_communities(&pool, None).await.unwrap().is_empty());
+
+    let old = &claims[0];
+    sqlx::query("UPDATE push_wake_outbox SET lease_until = now() - interval '1 second' WHERE community_id = $1 AND id = $2")
+        .bind(community.as_uuid()).bind(old.id).execute(&pool).await.unwrap();
+    assert_eq!(
+        due_wake_communities(&pool, None).await.unwrap(),
+        vec![community]
+    );
+    let recovered = claim_due_wakes(&pool, community, 16, until).await.unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(
+        recovered[0].id, old.id,
+        "gateway idempotency key survives recovery"
+    );
+    assert_ne!(recovered[0].claim_id, old.claim_id);
+    assert!(matches!(
+        revalidate_wake_for_send(&pool, community, old.id, old.claim_id)
+            .await
+            .unwrap(),
+        RevalidateWakeOutcome::Suppressed
+    ));
+    assert!(!complete_wake(&pool, community, old.id, old.claim_id)
+        .await
+        .unwrap());
+    assert!(
+        !retry_wake(&pool, community, old.id, old.claim_id, Utc::now())
+            .await
+            .unwrap()
+    );
+    assert!(!fail_wake(&pool, community, old.id, old.claim_id)
+        .await
+        .unwrap());
+    assert!(
+        complete_wake(&pool, community, old.id, recovered[0].claim_id)
+            .await
+            .unwrap()
+    );
+}
