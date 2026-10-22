@@ -6,9 +6,17 @@ SET LOCAL statement_timeout = '30s';
 ALTER TABLE entity_deletion_requests
     DROP CONSTRAINT entity_deletion_requests_status_check,
     ADD CONSTRAINT entity_deletion_requests_status_check
-        CHECK (status IN ('submitted', 'inventoried', 'approved')) NOT VALID,
+        CHECK (status IN ('submitted', 'inventoried', 'approved', 'running', 'retry_wait', 'completed')) NOT VALID,
     ADD COLUMN inventory_manifest JSONB,
-    ADD COLUMN inventory_digest TEXT;
+    ADD COLUMN inventory_digest TEXT,
+    ADD COLUMN lease_owner TEXT,
+    ADD COLUMN lease_generation BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN lease_expires_at TIMESTAMPTZ,
+    ADD COLUMN heartbeat_at TIMESTAMPTZ,
+    ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN next_attempt_at TIMESTAMPTZ,
+    ADD COLUMN last_error TEXT,
+    ADD COLUMN completed_at TIMESTAMPTZ;
 -- Validate in 0070 so the scan does not retain this transaction's DDL lock.
 
 -- Operator-global workflow history. Retained after community deletion as

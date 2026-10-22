@@ -2,8 +2,9 @@
 
 Submit saves a request and a fixed dummy inventory: community B (participant),
 then community C (former participant). These are artificial UUIDs, not discovered
-communities. Approve saves the approval and a pending `gate_user` stage. No worker
-runs and no user or community data is changed. Only `demo:` labels are accepted.
+communities. Approve saves the approval and a pending `gate_user` stage. The
+`run` command executes dummy handlers and saves each transition. No user or
+community data is deleted. Only `demo:` labels are accepted.
 
 ## Prepare a local database
 
@@ -137,19 +138,20 @@ key `(request_id, inventory_digest, approved_by)` makes retries idempotent.
 A digest that does not match the saved inventory is rejected. This slice has no
 inventory replacement or later approval gates yet; those policies can be added
 without replacing these historical rows. A partial unique index prevents two
-current stages for one request. Retries in the later executor will update the
-same stage row.
+current stages for one request. Executor retries update the same stage row.
 
 Operator names are self-asserted demo input. This is not authenticated approval
-for real deletion. Owned communities, worker leases, stage transitions, and
-actual deletion handlers belong to later changes.
+for real deletion. Owned communities and actual deletion handlers belong to
+later changes. Continue with [the executor walkthrough](operator-user-deletion-executor.md)
+to run the five dummy stages, inspect transitions, and try failure recovery.
 
 ## Upgrade and rollout
 
-Apply after the intake schema from PR #8496. Migrations 0069 and 0070 add nullable
-inventory columns, widen the lifecycle constraint, and create the
+Apply after the intake schema from PR #8496. Migrations 0069 and 0070 add
+inventory and execution fields, widen the lifecycle constraint, and create the
 operator-global stage-history and approval tables. Constraint validation uses a
-separate transaction so it does not retain the schema-change transaction's write-blocking lock. Both
+separate transaction so it does not retain the schema-change transaction's
+write-blocking lock. Both
 migrations set a five-second lock timeout and a thirty-second statement timeout.
 There are no new triggers, functions, foreign keys, or data backfills.
 
@@ -157,7 +159,8 @@ Existing `submitted` requests remain unchanged by migration. Resubmit with the
 same target, operator, and reason to prepare their dummy inventory; the request
 ID and original creation time stay unchanged. The previous CLI can still insert
 and read requests against the expanded schema. The serving relay does not
-execute these requests. Stage history and approvals intentionally survive
+automatically execute these requests; an operator runs the CLI worker explicitly.
+Stage history and approvals intentionally survive
 community deletion as operator recovery/audit evidence.
 
 Verify on a test environment with the submit, inspect, approve, and SQL commands
@@ -167,5 +170,6 @@ Do not roll back to an older auto-migrating relay without the deployment's
 reviewed rollback procedure; the additive schema itself can remain in place.
 
 The unmerged draft migration 0069 changed when approvals moved to their own
-table. If you tested an earlier draft, use a fresh disposable local database;
+table, and execution fields were added to requests. If you tested an earlier
+draft, use a fresh disposable local database;
 do not edit its sqlx checksums or erase its saved demo requests.

@@ -50,6 +50,8 @@ pub struct EntityInspection {
     /// Request fields remain at the top level of CLI JSON.
     #[serde(flatten)]
     pub request: EntityRequest,
+    /// Parent ownership, heartbeat, and retry state.
+    pub execution: EntityExecution,
     /// Retained approvals, ordered by approval time and identifier.
     pub approvals: Vec<EntityApproval>,
     /// History including the current resume position, if approved.
@@ -72,6 +74,7 @@ impl EntityDeletionStore {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| DbError::NotFound(format!("entity deletion request {id}")))?;
+        let execution = execution::read_execution(&mut tx, id).await?;
         let approvals = sqlx::query_as(
             "SELECT id, request_id, inventory_digest, approved_by, approved_at
              FROM entity_deletion_approvals WHERE request_id = $1
@@ -92,6 +95,7 @@ impl EntityDeletionStore {
         tx.commit().await?;
         Ok(EntityInspection {
             request,
+            execution,
             approvals,
             stage_history,
         })

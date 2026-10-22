@@ -1,0 +1,303 @@
+use super::*;
+use buzz_db::Db;
+
+async fn fixture() -> (EntityDeletionStore, Uuid, sqlx::PgPool) {
+    let url = std::env::var("BUZZ_TEST_DATABASE_URL")
+        .or_else(|_| std::env::var("DATABASE_URL"))
+        .unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let db = Db::from_pool(pool.clone());
+    if std::env::var("BUZZ_TEST_SCHEMA_MODE").as_deref() != Ok("desired") {
+        db.migrate().await.unwrap();
+    }
+    let store = db.entity_deletion_store();
+    let request = store
+        .submit("demo:runner", "submitter", None)
+        .await
+        .unwrap();
+    store
+        .approve(
+            request.id,
+            "approver",
+            request.inventory_digest.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+    (
+        store,
+        request.id,
+        sqlx::PgPool::connect(&url).await.unwrap(),
+    )
+}
+
+fn options() -> RunOptions {
+    RunOptions {
+        max_stages: 5,
+        fail_stage: None,
+        stage_delay: Duration::ZERO,
+    }
+}
+
+async fn assert_completed(store: &EntityDeletionStore, id: Uuid) {
+    let inspection = store.inspect(id).await.unwrap();
+    assert_eq!(inspection.request.status, "completed");
+    assert!(inspection.execution.completed_at.is_some());
+    assert!(inspection.execution.lease_owner.is_none());
+    assert_eq!(inspection.approvals.len(), 1);
+    let actual: Vec<_> = inspection
+        .stage_history
+        .iter()
+        .map(|s| {
+            (
+                s.stage.as_str(),
+                s.target_community_id.map(|id| id.to_string()),
+            )
+        })
+        .collect();
+    let b = Some("00000000-0000-0000-0000-00000000000b".to_owned());
+    let c = Some("00000000-0000-0000-0000-00000000000c".to_owned());
+    assert_eq!(
+        actual,
+        vec![
+            ("gate_user", None),
+            ("purge_db", b.clone()),
+            ("purge_agents", b),
+            ("purge_db", c.clone()),
+            ("purge_agents", c)
+        ]
+    );
+    for stage in &inspection.stage_history {
+        assert_eq!(stage.status, "completed");
+        assert!(!stage.is_current);
+        assert!(stage.started_at.is_some());
+        assert!(stage.finished_at >= stage.started_at);
+        assert_eq!(stage.metadata_json["dummy"], true);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn dummy_executor_completes_two_communities_and_completed_rerun_is_read_only() {
+    let (store, id, _) = fixture().await;
+    assert_eq!(
+        run(&store, id, "worker", &options(), &CancellationToken::new())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_completed(&store, id).await;
+    let before = serde_json::to_value(store.inspect(id).await.unwrap()).unwrap();
+    assert_eq!(
+        run(&store, id, "worker", &options(), &CancellationToken::new())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        serde_json::to_value(store.inspect(id).await.unwrap()).unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn dummy_executor_resumes_after_operator_pause_without_repeating_gate() {
+    let (store, id, _) = fixture().await;
+    let one = RunOptions {
+        max_stages: 1,
+        ..options()
+    };
+    run(&store, id, "worker-a", &one, &CancellationToken::new())
+        .await
+        .unwrap();
+    let paused = store.inspect(id).await.unwrap();
+    assert_eq!(paused.request.status, "running");
+    assert!(paused.execution.lease_owner.is_none());
+    assert_eq!(paused.stage_history.len(), 2);
+    assert_eq!(paused.stage_history[1].stage, "purge_db");
+    assert_eq!(paused.stage_history[1].status, "pending");
+    let gate = serde_json::to_value(&paused.stage_history[0]).unwrap();
+    run(
+        &store,
+        id,
+        "worker-b",
+        &options(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_completed(&store, id).await;
+    assert_eq!(
+        serde_json::to_value(&store.inspect(id).await.unwrap().stage_history[0]).unwrap(),
+        gate
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn dummy_executor_failure_retries_same_community_stage() {
+    let (store, id, pool) = fixture().await;
+    let fail = RunOptions {
+        fail_stage: Some("purge_db".to_owned()),
+        ..options()
+    };
+    assert_eq!(
+        run(&store, id, "worker-a", &fail, &CancellationToken::new())
+            .await
+            .unwrap(),
+        1
+    );
+    let failed = store.inspect(id).await.unwrap();
+    assert_eq!(failed.request.status, "retry_wait");
+    assert_eq!(failed.execution.retry_count, 1);
+    assert!(failed
+        .execution
+        .last_error
+        .as_deref()
+        .unwrap()
+        .contains("injected dummy failure"));
+    assert_eq!(failed.stage_history.len(), 2);
+    let stage_id = failed.stage_history[1].id;
+    let started = failed.stage_history[1].started_at;
+    assert_eq!(failed.stage_history[1].status, "failed");
+    assert!(run(
+        &store,
+        id,
+        "worker-b",
+        &options(),
+        &CancellationToken::new()
+    )
+    .await
+    .is_err());
+    sqlx::query("UPDATE entity_deletion_requests SET next_attempt_at = clock_timestamp() - interval '1 second' WHERE id = $1")
+        .bind(id).execute(&pool).await.unwrap();
+    run(
+        &store,
+        id,
+        "worker-b",
+        &options(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_completed(&store, id).await;
+    let after = store.inspect(id).await.unwrap();
+    assert_eq!(after.stage_history[1].id, stage_id);
+    assert_eq!(after.stage_history[1].started_at, started);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn dummy_executor_shutdown_keeps_running_stage_for_next_worker() {
+    let (store, id, _) = fixture().await;
+    let shutdown = CancellationToken::new();
+    let delayed = RunOptions {
+        stage_delay: Duration::from_secs(60),
+        ..options()
+    };
+    let work = run(&store, id, "worker-a", &delayed, &shutdown);
+    tokio::pin!(work);
+    // Poll the production executor until its durable running row is visible.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                result = &mut work => panic!("run finished before cancellation: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    if store.inspect(id).await.unwrap().stage_history[0].status == "running" { break; }
+                }
+            }
+        }
+    }).await.unwrap();
+    shutdown.cancel();
+    assert_eq!(work.await.unwrap(), 0);
+    let paused = store.inspect(id).await.unwrap();
+    assert_eq!(paused.stage_history[0].status, "running");
+    assert!(paused.execution.lease_owner.is_none());
+    let stage_id = paused.stage_history[0].id;
+    run(
+        &store,
+        id,
+        "worker-b",
+        &options(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_completed(&store, id).await;
+    assert_eq!(
+        store.inspect(id).await.unwrap().stage_history[0].id,
+        stage_id
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn dummy_handler_is_heartbeated_and_lease_loss_prevents_completion() {
+    let (store, id, pool) = fixture().await;
+    let lease = store
+        .claim(id, "worker", Duration::from_secs(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let stage = store.start_current(&lease).await.unwrap();
+    let before = store.inspect(id).await.unwrap().execution;
+    let delayed = RunOptions {
+        stage_delay: Duration::from_millis(1100),
+        ..options()
+    };
+    assert!(matches!(
+        run_stage_with_heartbeat(
+            &store,
+            &lease,
+            &stage,
+            &delayed,
+            &CancellationToken::new(),
+            Duration::from_millis(10)
+        )
+        .await,
+        StageOutcome::Completed
+    ));
+    let after = store.inspect(id).await.unwrap();
+    assert!(
+        after.execution.heartbeat_at.unwrap()
+            > before.heartbeat_at.unwrap() + chrono::Duration::seconds(1)
+    );
+    assert!(after.execution.lease_expires_at > before.lease_expires_at);
+    assert_eq!(after.stage_history.len(), 2);
+
+    let stage = store.start_current(&lease).await.unwrap();
+    sqlx::query("UPDATE entity_deletion_requests SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1")
+        .bind(id).execute(&pool).await.unwrap();
+    let delayed = RunOptions {
+        stage_delay: Duration::from_secs(60),
+        ..options()
+    };
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_stage_with_heartbeat(
+            &store,
+            &lease,
+            &stage,
+            &delayed,
+            &CancellationToken::new(),
+            Duration::from_millis(10),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, StageOutcome::Failed(_)));
+    let after = store.inspect(id).await.unwrap();
+    assert_eq!(after.stage_history.len(), 2);
+    assert_eq!(after.stage_history[1].status, "running");
+    assert!(after.stage_history[1].finished_at.is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn migration_schema_dummy_executor_completes_two_communities() {
+    let (store, id, _) = fixture().await;
+    run(&store, id, "worker", &options(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_completed(&store, id).await;
+}

@@ -125,7 +125,7 @@ async fn desired_schema_has_plain_intake_without_database_guards() {
     .is_err());
     assert!(sqlx::query(
         "INSERT INTO entity_deletion_requests (target, requested_by, status)
-         VALUES ('demo:alice', 'operator-a', 'running')",
+         VALUES ('demo:alice', 'operator-a', 'unsupported')",
     )
     .execute(&store.pool)
     .await

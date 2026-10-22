@@ -17,7 +17,7 @@ pub struct EntityRequest {
     pub entity_type: String,
     /// Synthetic `demo:` label, not a resolved account identity.
     pub target: String,
-    /// `submitted` (legacy intake), `inventoried`, or `approved`.
+    /// Intake, approval, execution (`running`/`retry_wait`), or `completed`.
     pub status: String,
     /// Operator identity supplied at submission.
     pub requested_by: String,
@@ -191,7 +191,10 @@ fn inventory_digest(inventory: &serde_json::Value) -> Result<String> {
 }
 
 mod approval;
+mod execution;
+mod transition;
 pub use approval::{EntityApproval, EntityInspection, EntityStage};
+pub use execution::{EntityExecution, EntityLease};
 
 #[cfg(test)]
 #[path = "entity_deletion_postgres_tests.rs"]
