@@ -20,6 +20,7 @@ use crate::events;
 
 use super::models;
 use super::relay_api::{self, fetch_channel_members, parse_channel_uuid};
+use super::roster::fetch_huddle_roster;
 use super::state::{HuddlePhase, HuddleState, VoiceInputMode};
 use super::stt;
 use super::tts;
@@ -126,10 +127,11 @@ pub async fn check_pipeline_hotstart(state: State<'_, AppState>) -> Result<(), S
             // Only update the throttle timestamp when at least one fetch succeeds,
             // so transient failures retry immediately on the next poll cycle.
             // Fetch both lists before acquiring the lock — no lock held across await.
-            let fresh_agents = fetch_channel_members(eph_id, Some("bot"), &state)
+            let fresh_agents = fetch_huddle_roster(eph_id, &state)
                 .await
-                .ok();
-            let fresh_members = fetch_channel_members(eph_id, None, &state).await.ok();
+                .ok()
+                .and_then(|roster| roster.complete_agents());
+            let fresh_members = fetch_channel_members(eph_id, &state).await.ok();
             let (roster_changed, transcription_auto_enabled) =
                 if fresh_agents.is_some() || fresh_members.is_some() {
                     let mut hs = state.huddle()?;
@@ -190,8 +192,13 @@ pub(crate) async fn post_connect_setup(
     // Hydrate agent pubkeys and participants from relay in parallel
     // (authoritative — overrides local guesses).
     let (agents_result, all_members_result) = tokio::join!(
-        fetch_channel_members(ephemeral_channel_id, Some("bot"), state),
-        fetch_channel_members(ephemeral_channel_id, None, state),
+        async {
+            fetch_huddle_roster(ephemeral_channel_id, state)
+                .await
+                .ok()
+                .and_then(|roster| roster.complete_agents())
+        },
+        fetch_channel_members(ephemeral_channel_id, state),
     );
     let (roster_changed, transcription_auto_enabled) = {
         let mut hs = state.huddle()?;
@@ -199,7 +206,7 @@ pub(crate) async fn post_connect_setup(
             return Ok(PostConnectOutcome::Stale);
         }
         let mut roster_changed = false;
-        if let Ok(agents) = agents_result {
+        if let Some(agents) = agents_result {
             let mut current_agents = hs.agent_pubkeys.lock().unwrap_or_else(|e| e.into_inner());
             if *current_agents != agents {
                 *current_agents = agents;
