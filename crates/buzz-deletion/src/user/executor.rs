@@ -11,11 +11,10 @@ use crate::{StageOutcome, DEFAULT_LEASE_DURATION, HEARTBEAT_INTERVAL, RETRY_DELA
 
 /// Controls for a synthetic run. Delays and failures never invoke real deletion.
 pub(super) struct RunOptions {
-    pub max_stages: u16,
+    pub next_step: bool,
     pub fail_stage: Option<String>,
     pub stage_delay: Duration,
     pub no_agents_in: Vec<Uuid>,
-    pub pause_after_handler: bool,
 }
 
 pub(super) async fn run(
@@ -55,6 +54,8 @@ async fn execute_claim(
 ) -> Result<i32> {
     let mut previous_stage_id = None;
     let mut executed = 0;
+    // Keep ordinary runs bounded; stepping uses the same transition boundary.
+    let handler_budget = if options.next_step { 1 } else { 100 };
     loop {
         if shutdown.is_cancelled() {
             return Ok(0);
@@ -66,7 +67,7 @@ async fn execute_claim(
                 return Ok(1);
             }
             NextStage::Stage(row) => {
-                if executed >= options.max_stages {
+                if executed >= handler_budget {
                     return Ok(0);
                 }
                 match run_stage_with_heartbeat(
@@ -85,9 +86,6 @@ async fn execute_claim(
                 }
                 previous_stage_id = Some(row.id);
                 executed += 1;
-                if options.pause_after_handler {
-                    return Ok(0);
-                }
             }
         }
     }

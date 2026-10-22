@@ -32,11 +32,10 @@ async fn fixture() -> (EntityDeletionStore, Uuid, sqlx::PgPool) {
 
 fn options() -> RunOptions {
     RunOptions {
-        max_stages: 5,
+        next_step: false,
         fail_stage: None,
         stage_delay: Duration::ZERO,
         no_agents_in: Vec::new(),
-        pause_after_handler: false,
     }
 }
 
@@ -107,10 +106,10 @@ async fn dummy_executor_completes_two_communities_and_completed_rerun_is_read_on
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
-async fn dummy_executor_resumes_after_operator_pause_without_repeating_gate() {
+async fn next_step_advances_one_handler_at_a_time_through_completion() {
     let (store, id, _) = fixture().await;
     let one = RunOptions {
-        max_stages: 1,
+        next_step: true,
         ..options()
     };
     run(&store, id, "worker-a", &one, &CancellationToken::new())
@@ -123,15 +122,30 @@ async fn dummy_executor_resumes_after_operator_pause_without_repeating_gate() {
     assert_eq!(paused.stage_history[1].stage, "purge_db");
     assert_eq!(paused.stage_history[1].status, "pending");
     let gate = serde_json::to_value(&paused.stage_history[0]).unwrap();
-    run(
-        &store,
-        id,
-        "worker-b",
-        &options(),
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    for completed_handlers in 2..=5 {
+        run(&store, id, "worker-b", &one, &CancellationToken::new())
+            .await
+            .unwrap();
+        let after = store.inspect(id).await.unwrap();
+        assert!(after.execution.lease_owner.is_none());
+        assert_eq!(
+            after
+                .stage_history
+                .iter()
+                .filter(|s| s.status == "completed")
+                .count(),
+            completed_handlers
+        );
+        if completed_handlers < 5 {
+            assert_eq!(after.stage_history.len(), completed_handlers + 1);
+            let current = after.stage_history.iter().find(|s| s.is_current).unwrap();
+            assert_eq!(current.status, "pending");
+            assert!(current.started_at.is_none());
+        } else {
+            assert_eq!(after.stage_history.len(), 5);
+            assert!(!after.stage_history.iter().any(|s| s.is_current));
+        }
+    }
     assert_completed(&store, id).await;
     assert_eq!(
         serde_json::to_value(&store.inspect(id).await.unwrap().stage_history[0]).unwrap(),
@@ -318,16 +332,10 @@ async fn migration_schema_dummy_executor_completes_two_communities() {
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
-async fn handler_pause_resumes_saved_branch_without_rerunning_action() {
+async fn restart_after_handler_resumes_saved_branch_without_rerunning_action() {
     let (store, id, _) = fixture().await;
     assert!(store.inspect(id).await.unwrap().stage_history.is_empty());
-    let paused = RunOptions {
-        pause_after_handler: true,
-        ..options()
-    };
-    run(&store, id, "worker-a", &paused, &CancellationToken::new())
-        .await
-        .unwrap();
+    execute_without_transition(&store, id, &options()).await;
     let after_gate = store.inspect(id).await.unwrap();
     assert_eq!(after_gate.stage_history.len(), 1);
     assert_eq!(after_gate.stage_history[0].status, "completed");
@@ -335,13 +343,10 @@ async fn handler_pause_resumes_saved_branch_without_rerunning_action() {
     let gate_finished = after_gate.stage_history[0].finished_at;
 
     let branch = RunOptions {
-        pause_after_handler: true,
         no_agents_in: vec![Uuid::from_u128(11)],
         ..options()
     };
-    run(&store, id, "worker-b", &branch, &CancellationToken::new())
-        .await
-        .unwrap();
+    execute_without_transition(&store, id, &branch).await;
     let after_db = store.inspect(id).await.unwrap();
     assert_eq!(after_db.stage_history.len(), 2);
     assert_eq!(
@@ -373,4 +378,21 @@ async fn handler_pause_resumes_saved_branch_without_rerunning_action() {
         .iter()
         .any(|row| row.target_community_id == Some(Uuid::from_u128(11))
             && row.stage == "purge_agents"));
+}
+
+// Simulate process exit after the real handler commits but before the worker
+// calls get_next_stage again. No operator-facing pause flag is needed.
+async fn execute_without_transition(store: &EntityDeletionStore, id: Uuid, options: &RunOptions) {
+    let lease = store
+        .claim(id, "interrupted-worker", DEFAULT_LEASE_DURATION)
+        .await
+        .unwrap()
+        .unwrap();
+    let NextStage::Stage(row) = store.get_next_stage(&lease, None).await.unwrap() else {
+        panic!("expected an executable stage");
+    };
+    handlers::dispatch(store, &lease, &row, options)
+        .await
+        .unwrap();
+    store.release(&lease).await.unwrap();
 }

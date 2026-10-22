@@ -37,9 +37,9 @@ pub enum Command {
         /// Worker identity; defaults to hostname and process id.
         #[arg(long)]
         executor_id: Option<String>,
-        /// Stop after this many handler invocations and release ownership.
-        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
-        max_stages: u16,
+        /// Execute one handler, transition to the next stage, and release ownership.
+        #[arg(long)]
+        next_step: bool,
         /// Inject a retryable failure when this dummy stage is reached.
         #[arg(long, value_parser = ["gate_user", "purge_db", "purge_agents"])]
         fail_stage: Option<String>,
@@ -49,9 +49,6 @@ pub enum Command {
         /// Simulate no agents in this community; may be repeated. Saves a runtime branch result.
         #[arg(long)]
         demo_no_agents_in: Vec<Uuid>,
-        /// Stop after saving one handler outcome, before get_next_stage processes it.
-        #[arg(long)]
-        pause_after_handler: bool,
     },
     /// List synthetic requests, newest first.
     List {
@@ -91,22 +88,20 @@ pub async fn run(command: Command) -> Result<i32> {
         Command::Run {
             id,
             executor_id,
-            max_stages,
+            next_step,
             fail_stage,
             stage_delay_ms,
             demo_no_agents_in,
-            pause_after_handler,
         } => {
             let code = executor::run(
                 &store,
                 id,
                 &executor_id.unwrap_or_else(crate::default_executor_id),
                 &executor::RunOptions {
-                    max_stages,
+                    next_step,
                     fail_stage,
                     stage_delay: std::time::Duration::from_millis(stage_delay_ms),
                     no_agents_in: demo_no_agents_in,
-                    pause_after_handler,
                 },
                 &crate::shutdown_token(),
             )

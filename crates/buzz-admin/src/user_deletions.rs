@@ -38,8 +38,7 @@ mod tests {
                 "user-deletions",
                 "run",
                 "00000000-0000-0000-0000-000000000001",
-                "--max-stages",
-                "1",
+                "--next-step",
                 "--executor-id",
                 "demo-worker",
                 "--fail-stage",
@@ -48,7 +47,6 @@ mod tests {
                 "1000",
                 "--demo-no-agents-in",
                 "00000000-0000-0000-0000-00000000000c",
-                "--pause-after-handler",
             ],
             vec!["buzz-admin", "user-deletions", "list"],
             vec![
@@ -70,8 +68,7 @@ mod tests {
         ])
         .is_err());
         for (flag, value) in [
-            ("--max-stages", "0"),
-            ("--max-stages", "1001"),
+            ("--max-stages", "1"),
             ("--stage-delay-ms", "60001"),
             ("--fail-stage", "real_delete"),
         ] {
@@ -85,6 +82,14 @@ mod tests {
             ])
             .is_err());
         }
+        assert!(crate::Cli::try_parse_from([
+            "buzz-admin",
+            "user-deletions",
+            "run",
+            "00000000-0000-0000-0000-000000000001",
+            "--pause-after-handler"
+        ])
+        .is_err());
         for command in ["inventory", "run", "drain", "worker"] {
             assert!(crate::Cli::try_parse_from(["buzz-admin", "user-deletions", command]).is_err());
         }

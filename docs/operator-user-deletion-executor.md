@@ -141,43 +141,45 @@ show_rows() {
 show_rows
 ```
 
-## Observe recovery before and after the transition
+## Advance one stage at a time
 
-Save the gate handler's result, then pause **before** processing its transition:
+Run the same command each time, then inspect the tables:
 
 ```bash
-./target/debug/buzz-admin user-deletions run "$REQUEST_ID" \
-  --executor-id worker-a --pause-after-handler
+./target/debug/buzz-admin user-deletions run "$REQUEST_ID" --next-step
 show_rows
 ```
 
-Expected: one `gate_user` row, `completed`, `is_current = true`, with inputs and
-result but no transition decision. Parent `running`; ownership released.
+Each invocation executes one handler, processes its saved result through
+`get_next_stage`, and releases ownership. It leaves the successor pending and
+current. The final invocation marks the request completed instead.
 
-Resume in a new process and execute one handler:
+Starting with a newly approved request, expect:
+
+| Invocation | Handler completed | Current stage after the command |
+| --- | --- | --- |
+| 1 | `gate_user` | B `purge_db`, pending |
+| 2 | B `purge_db` | B `purge_agents`, pending |
+| 3 | B `purge_agents` | C `purge_db`, pending |
+| 4 | C `purge_db` | C `purge_agents`, pending |
+| 5 | C `purge_agents` | None; request completed |
+
+All earlier rows remain completed and non-current. Every command releases the
+worker lease. Re-running a completed request is read-only. If a handler fails,
+the same row remains failed and current; the command exits 1 with a saved retry
+deadline instead of advancing past the failure.
+
+To finish the remaining workflow in one command, omit `--next-step`:
 
 ```bash
-./target/debug/buzz-admin user-deletions run "$REQUEST_ID" \
-  --executor-id worker-b --max-stages 1
+./target/debug/buzz-admin user-deletions run "$REQUEST_ID"
 show_rows
 ```
 
-The transition processes the saved gate result without repeating the gate.
-B's `purge_db` runs, saves `has_agents: true`, and transitions. Expected history:
-completed non-current gate, completed non-current B `purge_db`, pending current
-B `purge_agents`. Gate's result and finish time are unchanged.
-
-Resume again to finish:
-
-```bash
-./target/debug/buzz-admin user-deletions run "$REQUEST_ID" --executor-id worker-c
-show_rows
-```
-
-Expected: parent completed; five completed history rows; no current row; no owner.
-Re-running a completed request is read-only. `--max-stages` limits handler calls
-(default 100, maximum 1,000); the following transition is processed before
-pausing. `--pause-after-handler` intentionally pauses before that transition.
+Ordinary runs have an internal budget of 100 handler calls per invocation.
+There are no `--max-stages` or `--pause-after-handler` options. A crash can still
+leave a completed current row before its transition; the next run processes
+that saved result before executing the next unfinished handler.
 
 ## Test runtime branching
 
@@ -195,10 +197,11 @@ Expected: four completed rows: gate, B DB, B agents, C DB. C's DB result contain
 C agents row. The flag simulates a runtime observation in the dummy handler; it
 does not change the saved inventory or transition map. It may be repeated.
 
-To prove the result survives restart, on another request pause after the gate,
-then pause after B DB with `--demo-no-agents-in ...000b --pause-after-handler`.
-Resume without the flag: B agents is still skipped because routing reads B DB's
-saved result, not the new process's options.
+To inspect branching step by step, submit and approve another request. Run once
+with `--next-step` to finish the gate, then run with
+`--next-step --demo-no-agents-in 00000000-0000-0000-0000-00000000000b`.
+B DB completes and transitions directly to C DB. Resume without the flag: the
+saved B decision remains unchanged, and no B agents row appears.
 
 ## Test failure and retry
 
