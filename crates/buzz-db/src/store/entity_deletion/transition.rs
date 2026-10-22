@@ -1,107 +1,157 @@
-//! The one place that completes a stage and chooses its successor.
+//! The single transition entry point: initialize, resume, wait, advance, or finish.
+//! Handlers save results first. A completed current row is durable pending work
+//! for this transaction; clearing it and creating its successor commit together.
 
-use super::{execution::*, *};
+use super::{execution::*, workflow::*, *};
 
-#[derive(Debug, PartialEq)]
-pub(super) struct Step {
-    stage: &'static str,
-    community: Option<Uuid>,
-}
-
-pub(super) fn next_step(request: &EntityRequest, current: &EntityStage) -> Result<Option<Step>> {
-    let inventory = request
-        .inventory_manifest
-        .as_ref()
-        .ok_or_else(|| DbError::DeletionSafety("missing demo inventory".into()))?;
-    let communities = inventory["communities"]
-        .as_array()
-        .ok_or_else(|| DbError::DeletionSafety("missing demo communities".into()))?;
-    if communities.len() != 2 {
-        return Err(DbError::DeletionSafety(
-            "dummy workflow requires two communities".into(),
-        ));
-    }
-    let mut steps = vec![Step {
-        stage: "gate_user",
-        community: None,
-    }];
-    for community in communities {
-        let id = community["community_id"]
-            .as_str()
-            .ok_or_else(|| DbError::DeletionSafety("missing demo community id".into()))?;
-        let id = Uuid::parse_str(id).map_err(|e| DbError::InvalidData(e.to_string()))?;
-        for stage in ["purge_db", "purge_agents"] {
-            steps.push(Step {
-                stage,
-                community: Some(id),
-            });
-        }
-    }
-    let position = steps
-        .iter()
-        .position(|step| {
-            step.stage == current.stage && step.community == current.target_community_id
-        })
-        .ok_or_else(|| {
-            DbError::DeletionSafety("current stage is outside the approved dummy workflow".into())
-        })?;
-    Ok(steps.into_iter().nth(position + 1))
+/// The only routing information the executor needs.
+#[derive(Debug)]
+pub enum NextStage {
+    /// Full saved row, including handler inputs in metadata_json.inputs.
+    Stage(EntityStage),
+    /// Successful terminal status has been durably recorded.
+    Finished,
+    /// A handler failed and its persisted retry deadline has not arrived.
+    WaitUntil(DateTime<Utc>),
 }
 
 impl EntityDeletionStore {
-    /// Atomically finish the supplied current stage and save its successor.
+    /// Reload the saved position and return work or a terminal/wait outcome.
     ///
-    /// Handlers call this only after their work succeeds. The executor never
-    /// chooses the next community or independently marks a stage completed.
-    /// Returns true when this transition completes the entire request.
-    pub async fn complete_stage_and_advance(
+    /// `previous_stage_id` identifies the handler that just returned. On restart
+    /// pass None: the current row is authoritative. Repeated calls cannot apply
+    /// an old transition twice. This method never runs a business handler.
+    pub async fn get_next_stage(
         &self,
         lease: &EntityLease,
-        stage_id: Uuid,
-        metadata: serde_json::Value,
-    ) -> Result<bool> {
+        previous_stage_id: Option<Uuid>,
+    ) -> Result<NextStage> {
         let mut tx = self.pool.begin().await?;
         let request = lock_owned(&mut tx, lease).await?;
         validate_approved_inventory(&mut tx, &request).await?;
-        let current = require_running_stage(&mut tx, lease, stage_id).await?;
-        let next = next_step(&request, &current)?;
-        sqlx::query(
-            "UPDATE entity_deletion_stage_history
-             SET status = 'completed', is_current = false, finished_at = clock_timestamp(),
-                 metadata_json = $2, last_error = NULL, updated_at = clock_timestamp()
-             WHERE id = $1",
+        let inventory = Inventory::read(&request)?;
+        let history: Vec<EntityStage> = sqlx::query_as(
+            "SELECT id, request_id, target_community_id, stage, status, is_current,
+                    started_at, finished_at, metadata_json, last_error, updated_at
+             FROM entity_deletion_stage_history WHERE request_id = $1 LIMIT 10001",
         )
-        .bind(stage_id)
-        .bind(metadata)
-        .execute(&mut *tx)
+        .bind(request.id)
+        .fetch_all(&mut *tx)
         .await?;
-        if let Some(ref next) = next {
-            sqlx::query(
-                "INSERT INTO entity_deletion_stage_history (request_id, target_community_id, stage)
-                 VALUES ($1, $2, $3)",
-            )
-            .bind(lease.request_id)
-            .bind(next.community)
-            .bind(next.stage)
-            .execute(&mut *tx)
-            .await?;
+        if history.len() > 10000 {
+            return Err(invalid("workflow exceeds 10000 reached stages"));
         }
-        let completed = next.is_none();
-        sqlx::query(
-            "UPDATE entity_deletion_requests
-             SET status = CASE WHEN $2 THEN 'completed' ELSE 'running' END,
-                 completed_at = CASE WHEN $2 THEN clock_timestamp() ELSE NULL END,
-                 lease_owner = CASE WHEN $2 THEN NULL ELSE lease_owner END,
-                 lease_expires_at = CASE WHEN $2 THEN NULL ELSE lease_expires_at END,
-                 retry_count = 0, next_attempt_at = NULL, last_error = NULL,
-                 updated_at = clock_timestamp()
-             WHERE id = $1",
-        )
-        .bind(lease.request_id)
-        .bind(completed)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(completed)
+        if let Some(id) = previous_stage_id {
+            if !history.iter().any(|row| row.id == id) {
+                return Err(invalid("previous stage does not belong to this request"));
+            }
+        }
+        let mut progress = Progress::rebuild(&request, &inventory, &history)?;
+        if request.status == "completed" {
+            if !progress.terminal || progress.current.is_some() {
+                return Err(invalid("completed request has inconsistent stage history"));
+            }
+            return Ok(NextStage::Finished);
+        }
+        let Some(current) = progress.current.take() else {
+            if request.status != "approved" || !history.is_empty() {
+                return Err(invalid(
+                    "started request has no current stage or terminal outcome",
+                ));
+            }
+            let row = insert_stage(
+                &mut tx,
+                &request,
+                &inventory,
+                None,
+                Step {
+                    name: INITIAL_STAGE,
+                    community: None,
+                },
+            )
+            .await?;
+            sqlx::query("UPDATE entity_deletion_requests SET status = 'running', updated_at = clock_timestamp() WHERE id = $1")
+                .bind(request.id).execute(&mut *tx).await?;
+            tx.commit().await?;
+            return Ok(NextStage::Stage(row));
+        };
+        match current.status.as_str() {
+            "pending" | "running" => {
+                if request.status != "running" {
+                    return Err(invalid("executable stage has inconsistent parent status"));
+                }
+                Ok(NextStage::Stage(current))
+            }
+            "failed" => {
+                let retry: Option<(DateTime<Utc>, bool)> = sqlx::query_as(
+                    "SELECT next_attempt_at, next_attempt_at > clock_timestamp()
+                     FROM entity_deletion_requests WHERE id = $1 AND status = 'retry_wait' AND next_attempt_at IS NOT NULL",
+                ).bind(request.id).fetch_optional(&mut *tx).await?;
+                let (deadline, waiting) =
+                    retry.ok_or_else(|| invalid("failed stage has no retry record"))?;
+                if waiting {
+                    Ok(NextStage::WaitUntil(deadline))
+                } else {
+                    Ok(NextStage::Stage(current))
+                }
+            }
+            "completed" => {
+                let outcome = decision(&current)?;
+                let successor = progress.apply(&inventory, &current, outcome)?;
+                sqlx::query(
+                    "UPDATE entity_deletion_stage_history SET is_current = false,
+                     metadata_json = jsonb_set(metadata_json, '{transition}', $2),
+                     updated_at = clock_timestamp() WHERE id = $1",
+                )
+                .bind(current.id)
+                .bind(serde_json::to_value(outcome)?)
+                .execute(&mut *tx)
+                .await?;
+                let next = if let Some(step) = successor {
+                    NextStage::Stage(
+                        insert_stage(&mut tx, &request, &inventory, Some(current.id), step).await?,
+                    )
+                } else {
+                    if progress.completed_communities.len() != inventory.communities.len() {
+                        return Err(invalid("terminal transition leaves uncovered communities"));
+                    }
+                    NextStage::Finished
+                };
+                let finished = matches!(next, NextStage::Finished);
+                sqlx::query(
+                    "UPDATE entity_deletion_requests
+                     SET status = CASE WHEN $2 THEN 'completed' ELSE 'running' END,
+                         completed_at = CASE WHEN $2 THEN clock_timestamp() ELSE NULL END,
+                         retry_count = 0, next_attempt_at = NULL, last_error = NULL,
+                         updated_at = clock_timestamp() WHERE id = $1",
+                )
+                .bind(request.id)
+                .bind(finished)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok(next)
+            }
+            _ => Err(invalid("unknown current stage status")),
+        }
     }
+}
+
+async fn insert_stage(
+    tx: &mut Tx<'_>,
+    request: &EntityRequest,
+    inventory: &Inventory,
+    previous: Option<Uuid>,
+    step: Step,
+) -> Result<EntityStage> {
+    let metadata = serde_json::json!({
+        "inputs": inventory.inputs(&request.target, step.community)?,
+        "previous_stage_id": previous,
+    });
+    Ok(sqlx::query_as(
+        "INSERT INTO entity_deletion_stage_history (request_id, target_community_id, stage, metadata_json)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, request_id, target_community_id, stage, status, is_current,
+                   started_at, finished_at, metadata_json, last_error, updated_at",
+    ).bind(request.id).bind(step.community).bind(step.name).bind(metadata).fetch_one(&mut **tx).await?)
 }

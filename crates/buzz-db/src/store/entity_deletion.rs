@@ -193,8 +193,10 @@ fn inventory_digest(inventory: &serde_json::Value) -> Result<String> {
 mod approval;
 mod execution;
 mod transition;
+mod workflow;
 pub use approval::{EntityApproval, EntityInspection, EntityStage};
 pub use execution::{EntityExecution, EntityLease};
+pub use transition::NextStage;
 
 #[cfg(test)]
 #[path = "entity_deletion_postgres_tests.rs"]

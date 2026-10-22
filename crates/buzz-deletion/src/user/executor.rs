@@ -1,9 +1,9 @@
-//! Bounded, PostgreSQL-only execution of the five-stage dummy workflow.
+//! Ownership and dispatch only; get_next_stage owns all workflow routing.
 
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use buzz_db::entity_deletion::{EntityDeletionStore, EntityLease, EntityStage};
+use buzz_db::entity_deletion::{EntityDeletionStore, EntityLease, EntityStage, NextStage};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -14,6 +14,8 @@ pub(super) struct RunOptions {
     pub max_stages: u16,
     pub fail_stage: Option<String>,
     pub stage_delay: Duration,
+    pub no_agents_in: Vec<Uuid>,
+    pub pause_after_handler: bool,
 }
 
 pub(super) async fn run(
@@ -51,38 +53,44 @@ async fn execute_claim(
     options: &RunOptions,
     shutdown: &CancellationToken,
 ) -> Result<i32> {
-    // One invocation stops on its first failure and never spins on a retry.
-    // The CLI bounds max_stages to the five steps in this fixed dummy workflow.
-    for _ in 0..options.max_stages {
+    let mut previous_stage_id = None;
+    let mut executed = 0;
+    loop {
         if shutdown.is_cancelled() {
             return Ok(0);
         }
-        let stage = store.start_current(lease).await?;
-        let outcome =
-            run_stage_with_heartbeat(store, lease, &stage, options, shutdown, HEARTBEAT_INTERVAL)
-                .await;
-        match outcome {
-            StageOutcome::Completed => {
-                if store.get(lease.request_id).await?.status == "completed" {
-                    return Ok(0);
-                }
-            }
-            StageOutcome::Shutdown => return Ok(0),
-            StageOutcome::Failed(error) => {
-                eprintln!("dummy stage {} failed: {error:#}", stage.stage);
-                // An uncertain completion response can arrive after its commit.
-                // Never mark a successor stage failed using the previous row id.
-                if store.get(lease.request_id).await?.status == "completed" {
-                    return Ok(0);
-                }
-                store
-                    .fail_stage(lease, stage.id, &format!("{error:#}"), RETRY_DELAY)
-                    .await?;
+        match store.get_next_stage(lease, previous_stage_id).await? {
+            NextStage::Finished => return Ok(0),
+            NextStage::WaitUntil(deadline) => {
+                eprintln!("request {} waits until {deadline}", lease.request_id);
                 return Ok(1);
+            }
+            NextStage::Stage(row) => {
+                if executed >= options.max_stages {
+                    return Ok(0);
+                }
+                match run_stage_with_heartbeat(
+                    store,
+                    lease,
+                    &row,
+                    options,
+                    shutdown,
+                    HEARTBEAT_INTERVAL,
+                )
+                .await
+                {
+                    StageOutcome::Completed => {}
+                    StageOutcome::Shutdown => return Ok(0),
+                    StageOutcome::Failed(error) => return Err(error),
+                }
+                previous_stage_id = Some(row.id);
+                executed += 1;
+                if options.pause_after_handler {
+                    return Ok(0);
+                }
             }
         }
     }
-    Ok(0)
 }
 
 async fn run_stage_with_heartbeat(
@@ -98,102 +106,25 @@ async fn run_stage_with_heartbeat(
     let mut interval = tokio::time::interval(heartbeat_period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let heartbeat_lost = CancellationToken::new();
-    loop {
-        // Reuse the community executor's cancellation/outcome helper. Keeping
-        // renewal in this task avoids a detached heartbeat when a run is dropped.
-        tokio::select! {
-            biased;
-            result = crate::await_stage(&mut handler, shutdown, &heartbeat_lost) => return result,
-            _ = interval.tick() => {
-                if let Err(error) = store.heartbeat(lease, DEFAULT_LEASE_DURATION).await {
-                    return StageOutcome::Failed(error.into());
-                }
+    // Poll renewal alongside the handler. Awaiting renewal inside a selected
+    // timer branch would stop polling a handler that may hold the parent lock.
+    // Both futures live here, so cancellation leaves no detached heartbeat task.
+    let renewal = async {
+        loop {
+            interval.tick().await;
+            if let Err(error) = store.heartbeat(lease, DEFAULT_LEASE_DURATION).await {
+                return error;
             }
         }
+    };
+    tokio::select! {
+        biased;
+        result = crate::await_stage(&mut handler, shutdown, &heartbeat_lost) => result,
+        error = renewal => StageOutcome::Failed(error.into()),
     }
 }
 
-mod handlers {
-    use super::*;
-
-    pub(super) async fn dispatch(
-        store: &EntityDeletionStore,
-        lease: &EntityLease,
-        stage: &EntityStage,
-        options: &RunOptions,
-    ) -> Result<()> {
-        match stage.stage.as_str() {
-            "gate_user" => gate_user(store, lease, stage, options).await,
-            "purge_db" => purge_db(store, lease, stage, options).await,
-            "purge_agents" => purge_agents(store, lease, stage, options).await,
-            name => bail!("unknown dummy stage {name}"),
-        }
-    }
-
-    async fn gate_user(
-        store: &EntityDeletionStore,
-        lease: &EntityLease,
-        stage: &EntityStage,
-        options: &RunOptions,
-    ) -> Result<()> {
-        dummy_action(store, lease, stage, options, "would gate user").await
-    }
-
-    async fn purge_db(
-        store: &EntityDeletionStore,
-        lease: &EntityLease,
-        stage: &EntityStage,
-        options: &RunOptions,
-    ) -> Result<()> {
-        dummy_action(
-            store,
-            lease,
-            stage,
-            options,
-            "would purge user database rows",
-        )
-        .await
-    }
-
-    async fn purge_agents(
-        store: &EntityDeletionStore,
-        lease: &EntityLease,
-        stage: &EntityStage,
-        options: &RunOptions,
-    ) -> Result<()> {
-        dummy_action(store, lease, stage, options, "would purge user agents").await
-    }
-
-    async fn dummy_action(
-        store: &EntityDeletionStore,
-        lease: &EntityLease,
-        stage: &EntityStage,
-        options: &RunOptions,
-        message: &str,
-    ) -> Result<()> {
-        eprintln!(
-            "DUMMY request={} stage={} community={:?}: {message}",
-            lease.request_id, stage.stage, stage.target_community_id
-        );
-        tokio::time::sleep(options.stage_delay).await;
-        if options.fail_stage.as_deref() == Some(stage.stage.as_str()) {
-            bail!("injected dummy failure for {}", stage.stage);
-        }
-        // The stage initiates completion. The store owns the single transaction
-        // and decides both the next stage and the next community.
-        store
-            .complete_stage_and_advance(
-                lease,
-                stage.id,
-                serde_json::json!({
-                    "dummy": true,
-                    "message": message,
-                }),
-            )
-            .await?;
-        Ok(())
-    }
-}
+mod handlers;
 
 #[cfg(test)]
 mod postgres_tests;

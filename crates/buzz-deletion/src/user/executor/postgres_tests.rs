@@ -35,6 +35,8 @@ fn options() -> RunOptions {
         max_stages: 5,
         fail_stage: None,
         stage_delay: Duration::ZERO,
+        no_agents_in: Vec::new(),
+        pause_after_handler: false,
     }
 }
 
@@ -71,7 +73,7 @@ async fn assert_completed(store: &EntityDeletionStore, id: Uuid) {
         assert!(!stage.is_current);
         assert!(stage.started_at.is_some());
         assert!(stage.finished_at >= stage.started_at);
-        assert_eq!(stage.metadata_json["dummy"], true);
+        assert_eq!(stage.metadata_json["result"]["dummy"], true);
     }
 }
 
@@ -80,9 +82,13 @@ async fn assert_completed(store: &EntityDeletionStore, id: Uuid) {
 async fn dummy_executor_completes_two_communities_and_completed_rerun_is_read_only() {
     let (store, id, _) = fixture().await;
     assert_eq!(
-        run(&store, id, "worker", &options(), &CancellationToken::new())
-            .await
-            .unwrap(),
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            run(&store, id, "worker", &options(), &CancellationToken::new())
+        )
+        .await
+        .unwrap()
+        .unwrap(),
         0
     );
     assert_completed(&store, id).await;
@@ -203,7 +209,7 @@ async fn dummy_executor_shutdown_keeps_running_stage_for_next_worker() {
             tokio::select! {
                 result = &mut work => panic!("run finished before cancellation: {result:?}"),
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                    if store.inspect(id).await.unwrap().stage_history[0].status == "running" { break; }
+                    if store.inspect(id).await.unwrap().stage_history.first().is_some_and(|s| s.status == "running") { break; }
                 }
             }
         }
@@ -239,7 +245,10 @@ async fn dummy_handler_is_heartbeated_and_lease_loss_prevents_completion() {
         .await
         .unwrap()
         .unwrap();
-    let stage = store.start_current(&lease).await.unwrap();
+    let stage = match store.get_next_stage(&lease, None).await.unwrap() {
+        NextStage::Stage(row) => row,
+        other => panic!("{other:?}"),
+    };
     let before = store.inspect(id).await.unwrap().execution;
     let delayed = RunOptions {
         stage_delay: Duration::from_millis(1100),
@@ -263,9 +272,14 @@ async fn dummy_handler_is_heartbeated_and_lease_loss_prevents_completion() {
             > before.heartbeat_at.unwrap() + chrono::Duration::seconds(1)
     );
     assert!(after.execution.lease_expires_at > before.lease_expires_at);
-    assert_eq!(after.stage_history.len(), 2);
+    assert_eq!(after.stage_history.len(), 1);
+    assert!(after.stage_history[0].is_current);
+    assert_eq!(after.stage_history[0].status, "completed");
 
-    let stage = store.start_current(&lease).await.unwrap();
+    let stage = match store.get_next_stage(&lease, None).await.unwrap() {
+        NextStage::Stage(row) => row,
+        other => panic!("{other:?}"),
+    };
     sqlx::query("UPDATE entity_deletion_requests SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1")
         .bind(id).execute(&pool).await.unwrap();
     let delayed = RunOptions {
@@ -288,7 +302,7 @@ async fn dummy_handler_is_heartbeated_and_lease_loss_prevents_completion() {
     assert!(matches!(outcome, StageOutcome::Failed(_)));
     let after = store.inspect(id).await.unwrap();
     assert_eq!(after.stage_history.len(), 2);
-    assert_eq!(after.stage_history[1].status, "running");
+    assert_eq!(after.stage_history[1].status, "pending");
     assert!(after.stage_history[1].finished_at.is_none());
 }
 
@@ -300,4 +314,63 @@ async fn migration_schema_dummy_executor_completes_two_communities() {
         .await
         .unwrap();
     assert_completed(&store, id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn handler_pause_resumes_saved_branch_without_rerunning_action() {
+    let (store, id, _) = fixture().await;
+    assert!(store.inspect(id).await.unwrap().stage_history.is_empty());
+    let paused = RunOptions {
+        pause_after_handler: true,
+        ..options()
+    };
+    run(&store, id, "worker-a", &paused, &CancellationToken::new())
+        .await
+        .unwrap();
+    let after_gate = store.inspect(id).await.unwrap();
+    assert_eq!(after_gate.stage_history.len(), 1);
+    assert_eq!(after_gate.stage_history[0].status, "completed");
+    assert!(after_gate.stage_history[0].is_current);
+    let gate_finished = after_gate.stage_history[0].finished_at;
+
+    let branch = RunOptions {
+        pause_after_handler: true,
+        no_agents_in: vec![Uuid::from_u128(11)],
+        ..options()
+    };
+    run(&store, id, "worker-b", &branch, &CancellationToken::new())
+        .await
+        .unwrap();
+    let after_db = store.inspect(id).await.unwrap();
+    assert_eq!(after_db.stage_history.len(), 2);
+    assert_eq!(
+        after_db.stage_history[1].metadata_json["result"]["has_agents"],
+        false
+    );
+    let db_finished = after_db.stage_history[1].finished_at;
+    // No skip flag on restart: routing must use the persisted result, not new options.
+    run(
+        &store,
+        id,
+        "worker-c",
+        &options(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let completed = store.inspect(id).await.unwrap();
+    assert_eq!(completed.request.status, "completed");
+    assert_eq!(completed.stage_history.len(), 4);
+    assert_eq!(completed.stage_history[0].finished_at, gate_finished);
+    assert_eq!(completed.stage_history[1].finished_at, db_finished);
+    assert_eq!(
+        completed.stage_history[1].metadata_json["transition"]["kind"],
+        "community_complete"
+    );
+    assert!(!completed
+        .stage_history
+        .iter()
+        .any(|row| row.target_community_id == Some(Uuid::from_u128(11))
+            && row.stage == "purge_agents"));
 }

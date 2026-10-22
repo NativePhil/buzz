@@ -46,6 +46,9 @@ mod tests {
                 "purge_db",
                 "--stage-delay-ms",
                 "1000",
+                "--demo-no-agents-in",
+                "00000000-0000-0000-0000-00000000000c",
+                "--pause-after-handler",
             ],
             vec!["buzz-admin", "user-deletions", "list"],
             vec![
@@ -68,7 +71,7 @@ mod tests {
         .is_err());
         for (flag, value) in [
             ("--max-stages", "0"),
-            ("--max-stages", "6"),
+            ("--max-stages", "1001"),
             ("--stage-delay-ms", "60001"),
             ("--fail-stage", "real_delete"),
         ] {

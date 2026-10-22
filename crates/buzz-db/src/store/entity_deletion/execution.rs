@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use super::*;
 
-type Tx<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
+pub(super) type Tx<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
 
 /// Ownership token; this generation fences executor writes, not serving traffic.
 #[derive(Debug, Clone)]
@@ -79,14 +79,12 @@ impl EntityDeletionStore {
             return Ok(None);
         };
         validate_approved_inventory(&mut tx, &request).await?;
-        let stage = current_stage(&mut tx, id).await?;
-        super::transition::next_step(&request, &stage)?;
         let generation = sqlx::query_scalar(
             "UPDATE entity_deletion_requests
-             SET status = 'running', lease_owner = $2,
+             SET lease_owner = $2,
                  lease_generation = lease_generation + 1,
                  lease_expires_at = clock_timestamp() + $3 * interval '1 millisecond',
-                 heartbeat_at = clock_timestamp(), next_attempt_at = NULL,
+                 heartbeat_at = clock_timestamp(),
                  updated_at = clock_timestamp()
              WHERE id = $1 RETURNING lease_generation",
         )
@@ -122,13 +120,31 @@ impl EntityDeletionStore {
         Ok(())
     }
 
-    /// Mark the saved current stage running, preserving its first start time on retry.
-    pub async fn start_current(&self, lease: &EntityLease) -> Result<EntityStage> {
+    /// Start the supplied current stage, preserving its first start time on retry.
+    pub async fn start_stage(&self, lease: &EntityLease, stage_id: Uuid) -> Result<EntityStage> {
         let mut tx = self.pool.begin().await?;
         let request = lock_owned(&mut tx, lease).await?;
         validate_approved_inventory(&mut tx, &request).await?;
         let stage = current_stage(&mut tx, lease.request_id).await?;
-        super::transition::next_step(&request, &stage)?;
+        if stage.id != stage_id
+            || !matches!(stage.status.as_str(), "pending" | "running" | "failed")
+        {
+            return Err(DbError::DeletionSafety(
+                "stage is no longer executable".into(),
+            ));
+        }
+        let due: bool = sqlx::query_scalar(
+            "SELECT next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()
+             FROM entity_deletion_requests WHERE id = $1",
+        )
+        .bind(lease.request_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !due {
+            return Err(DbError::DeletionSafety("stage retry is not due".into()));
+        }
+        sqlx::query("UPDATE entity_deletion_requests SET status = 'running', next_attempt_at = NULL WHERE id = $1")
+            .bind(lease.request_id).execute(&mut *tx).await?;
         let stage = sqlx::query_as(
             "UPDATE entity_deletion_stage_history
              SET status = 'running', started_at = COALESCE(started_at, clock_timestamp()),
@@ -144,7 +160,8 @@ impl EntityDeletionStore {
         Ok(stage)
     }
 
-    /// Record failure on the same current row and release the parent until retry is due.
+    /// Record failure and its retry deadline; get_next_stage returns WaitUntil.
+    /// Ownership is released by the worker after it observes that outcome.
     pub async fn fail_stage(
         &self,
         lease: &EntityLease,
@@ -170,7 +187,7 @@ impl EntityDeletionStore {
             "UPDATE entity_deletion_requests
              SET status = 'retry_wait', retry_count = retry_count + 1, last_error = $2,
                  next_attempt_at = clock_timestamp() + $3 * interval '1 millisecond',
-                 lease_owner = NULL, lease_expires_at = NULL, updated_at = clock_timestamp()
+                 updated_at = clock_timestamp()
              WHERE id = $1",
         )
         .bind(lease.request_id)
@@ -182,15 +199,41 @@ impl EntityDeletionStore {
         Ok(())
     }
 
+    /// Save a handler's result without switching stages. A completed current row
+    /// is the durable journal for a transition that has not committed yet.
+    pub async fn save_stage_success(
+        &self,
+        lease: &EntityLease,
+        stage_id: Uuid,
+        result: serde_json::Value,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let request = lock_owned(&mut tx, lease).await?;
+        validate_approved_inventory(&mut tx, &request).await?;
+        require_running_stage(&mut tx, lease, stage_id).await?;
+        sqlx::query(
+            "UPDATE entity_deletion_stage_history SET status = 'completed',
+             finished_at = clock_timestamp(), last_error = NULL,
+             metadata_json = jsonb_set(metadata_json, '{result}', $2),
+             updated_at = clock_timestamp() WHERE id = $1",
+        )
+        .bind(stage_id)
+        .bind(result)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Release this live claim after a pause or shutdown, without advancing its stage.
     ///
-    /// Returns false after completion or ownership loss; never clears a successor's lease.
+    /// Returns false after ownership loss; never clears a successor's lease.
     pub async fn release(&self, lease: &EntityLease) -> Result<bool> {
         Ok(sqlx::query(
             "UPDATE entity_deletion_requests SET lease_owner = NULL, lease_expires_at = NULL,
                  updated_at = clock_timestamp()
              WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3
-               AND status = 'running' AND lease_expires_at > clock_timestamp()",
+               AND lease_expires_at > clock_timestamp()",
         )
         .bind(lease.request_id)
         .bind(&lease.owner)
@@ -215,7 +258,7 @@ pub(super) async fn lock_owned(tx: &mut Tx<'_>, lease: &EntityLease) -> Result<E
     .await?
     .ok_or_else(|| stale_lease(lease))?;
     let owned: bool = sqlx::query_scalar(
-        "SELECT COALESCE(status = 'running' AND lease_owner = $2 AND lease_generation = $3
+        "SELECT COALESCE(status IN ('approved', 'running', 'retry_wait', 'completed') AND lease_owner = $2 AND lease_generation = $3
                 AND lease_expires_at > clock_timestamp(), false)
          FROM entity_deletion_requests WHERE id = $1",
     )
@@ -240,11 +283,6 @@ pub(super) async fn current_stage(tx: &mut Tx<'_>, id: Uuid) -> Result<EntitySta
     .fetch_optional(&mut **tx)
     .await?
     .ok_or_else(|| DbError::DeletionSafety("unfinished request has no current stage".into()))?;
-    if !matches!(stage.status.as_str(), "pending" | "running" | "failed") {
-        return Err(DbError::DeletionSafety(
-            "current stage is already completed".into(),
-        ));
-    }
     Ok(stage)
 }
 
@@ -266,20 +304,7 @@ pub(super) async fn validate_approved_inventory(
     tx: &mut Tx<'_>,
     request: &EntityRequest,
 ) -> Result<()> {
-    validate_submission(
-        &request.target,
-        &request.requested_by,
-        request.reason.as_deref(),
-    )?;
-    let inventory = demo_inventory(&request.target);
-    let digest = inventory_digest(&inventory)?;
-    if request.inventory_manifest.as_ref() != Some(&inventory)
-        || request.inventory_digest.as_deref() != Some(&digest)
-    {
-        return Err(DbError::DeletionSafety(
-            "saved demo inventory changed".into(),
-        ));
-    }
+    let digest = workflow::validated_inventory_digest(request)?;
     let approved: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM entity_deletion_approvals
          WHERE request_id = $1 AND inventory_digest = $2)",

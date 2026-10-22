@@ -225,16 +225,7 @@ async fn approval_is_atomic_idempotent_and_bound_to_inventory() {
     assert_eq!(after.approvals[0].request_id, request.id);
     assert_eq!(after.approvals[0].approved_by, "operator-b");
     assert_eq!(after.approvals[0].inventory_digest, digest);
-    assert_eq!(after.stage_history.len(), 1);
-    let stage = &after.stage_history[0];
-    assert_eq!(stage.request_id, request.id);
-    assert_eq!(stage.stage, "gate_user");
-    assert_eq!(stage.status, "pending");
-    assert!(stage.is_current);
-    assert!(stage.target_community_id.is_none());
-    assert!(stage.started_at.is_none());
-    assert!(stage.finished_at.is_none());
-    assert_eq!(stage.metadata_json, serde_json::json!({}));
+    assert!(after.stage_history.is_empty());
     store
         .approve(request.id, "operator-b", digest)
         .await
@@ -275,6 +266,13 @@ async fn approval_is_atomic_idempotent_and_bound_to_inventory() {
         .is_err());
     assert_eq!(store.inspect(request.id).await.unwrap().approvals.len(), 2);
     // The invariant is enforced by the live partial unique index.
+    sqlx::query(
+        "INSERT INTO entity_deletion_stage_history (request_id, stage) VALUES ($1, 'first')",
+    )
+    .bind(request.id)
+    .execute(&store.pool)
+    .await
+    .unwrap();
     assert!(sqlx::query(
         "INSERT INTO entity_deletion_stage_history (request_id, stage) VALUES ($1, 'drain')"
     )
@@ -291,21 +289,15 @@ async fn approval_is_atomic_idempotent_and_bound_to_inventory() {
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
-async fn approval_rolls_back_when_starting_stage_cannot_be_saved() {
+async fn approval_rolls_back_when_evidence_cannot_be_saved() {
     let store = store().await;
     let request = store
         .submit("demo:rollback", "operator-a", None)
         .await
         .unwrap();
-    // Fault injection: a current row makes the final INSERT fail after the
-    // parent UPDATE and approval INSERT. Both must roll back.
-    sqlx::query(
-        "INSERT INTO entity_deletion_stage_history (request_id, stage) VALUES ($1, 'unexpected')",
-    )
-    .bind(request.id)
-    .execute(&store.pool)
-    .await
-    .unwrap();
+    // Force approval evidence to fail after the parent status update.
+    sqlx::query("ALTER TABLE entity_deletion_approvals ADD CONSTRAINT reject_approval CHECK (approved_by <> 'operator-b') NOT VALID")
+        .execute(&store.pool).await.unwrap();
     let before = store.inspect(request.id).await.unwrap();
     assert!(store
         .approve(
@@ -323,7 +315,7 @@ async fn approval_rolls_back_when_starting_stage_cannot_be_saved() {
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
-async fn approval_refuses_changed_inventory_and_missing_resume_position() {
+async fn approval_refuses_changed_inventory_and_unexpected_stage_history() {
     let store = store().await;
     let request = store
         .submit("demo:changed", "operator-a", None)
@@ -353,21 +345,21 @@ async fn approval_refuses_changed_inventory_and_missing_resume_position() {
         .approve(request.id, "operator-b", digest)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM entity_deletion_stage_history WHERE request_id = $1")
-        .bind(request.id)
-        .execute(&store.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO entity_deletion_stage_history (request_id, stage) VALUES ($1, 'unexpected')",
+    )
+    .bind(request.id)
+    .execute(&store.pool)
+    .await
+    .unwrap();
     assert!(store
         .approve(request.id, "operator-b", digest)
         .await
         .is_err());
-    assert!(store
-        .inspect(request.id)
-        .await
-        .unwrap()
-        .stage_history
-        .is_empty());
+    assert_eq!(
+        store.inspect(request.id).await.unwrap().stage_history.len(),
+        1
+    );
 }
 
 #[tokio::test]

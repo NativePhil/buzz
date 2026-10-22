@@ -2,8 +2,9 @@
 
 Submit saves a request and a fixed dummy inventory: community B (participant),
 then community C (former participant). These are artificial UUIDs, not discovered
-communities. Approve saves the approval and a pending `gate_user` stage. The
-`run` command executes dummy handlers and saves each transition. No user or
+communities. Approve saves authorization without creating stages. The
+`run` command initializes execution through `get_next_stage`, dispatches dummy
+handlers, and asks the transition function for the next saved row. No user or
 community data is deleted. Only `demo:` labels are accepted.
 
 ## Prepare a local database
@@ -71,7 +72,7 @@ target, operator, and reason returns that row without changing its timestamps.
 Reusing the target with a different operator or reason fails and preserves the
 original row. Use a new `demo:` label for a new request.
 
-## Approve and see the starting stage
+## Approve without starting execution
 
 Inspect the inventory before approving. Copy its `inventory_digest` into the
 command so approval is bound to what you inspected:
@@ -90,23 +91,9 @@ rows in an `approvals` array (empty before approval), ordered by time and ID.
 The parent keeps the inventory; approval rows bind each operator's decision to
 its digest without overwriting earlier decisions.
 
-`stage_history` contains exactly one row:
-
-```json
-{
-  "stage": "gate_user",
-  "status": "pending",
-  "is_current": true,
-  "target_community_id": null,
-  "started_at": null,
-  "finished_at": null,
-  "metadata_json": {}
-}
-```
-
-The row also includes its UUID, parent request UUID, `last_error`, and update
-time. It has not started executing. Inspect reads parent, approvals, and history
-from one consistent database snapshot.
+`stage_history` is empty after approval. The first `run` creates the initial
+stage. Inspection reads parent, approvals, and history from one consistent
+snapshot. No worker is started by approval.
 
 ```bash
 docker exec buzz-user-deletion-intake psql -X -U buzz -d buzz -c \
@@ -121,8 +108,8 @@ docker exec buzz-user-deletion-intake psql -X -U buzz -d buzz -c \
    FROM entity_deletion_stage_history;"
 ```
 
-The first approval inserts an approval row, changes the parent status, and
-creates the first stage in one transaction. A failure rolls all three back.
+The first approval inserts an approval row and changes the parent status in
+one transaction. A failure rolls both back.
 Repeating the same operator and digest preserves the approval ID and timestamp.
 Another operator adds a new approval row, with its own time, without creating
 another stage or changing the earlier approval:
@@ -133,7 +120,7 @@ another stage or changing the earlier approval:
 ./target/debug/buzz-admin user-deletions inspect "$REQUEST_ID"
 ```
 
-There are now two approvals and still one pending `gate_user` row. The unique
+There are now two approvals and still no stage rows. The unique
 key `(request_id, inventory_digest, approved_by)` makes retries idempotent.
 A digest that does not match the saved inventory is rejected. This slice has no
 inventory replacement or later approval gates yet; those policies can be added
@@ -173,3 +160,9 @@ The unmerged draft migration 0069 changed when approvals moved to their own
 table, and execution fields were added to requests. If you tested an earlier
 draft, use a fresh disposable local database;
 do not edit its sqlx checksums or erase its saved demo requests.
+
+This executor revision does not change SQL schema. Earlier draft requests whose
+stage metadata predates saved inputs/results/predecessor IDs are not a supported
+resume format. Keep their records intact and submit a new `demo:` label to test
+this version. Approval no longer creates a gate row; it is initialized by the
+first `get_next_stage` call under worker ownership.

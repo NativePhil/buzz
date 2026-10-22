@@ -19,7 +19,7 @@ pub enum Command {
         #[arg(long)]
         reason: Option<String>,
     },
-    /// Approve the saved demo inventory and create its first pending stage.
+    /// Approve the saved inventory; execution initializes the first stage.
     Approve {
         /// Request UUID returned by submit.
         id: Uuid,
@@ -37,8 +37,8 @@ pub enum Command {
         /// Worker identity; defaults to hostname and process id.
         #[arg(long)]
         executor_id: Option<String>,
-        /// Stop after this many completed stages and release ownership.
-        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u16).range(1..=5))]
+        /// Stop after this many handler invocations and release ownership.
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
         max_stages: u16,
         /// Inject a retryable failure when this dummy stage is reached.
         #[arg(long, value_parser = ["gate_user", "purge_db", "purge_agents"])]
@@ -46,6 +46,12 @@ pub enum Command {
         /// Delay each dummy action for inspection and shutdown testing (up to 60s).
         #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=60_000))]
         stage_delay_ms: u64,
+        /// Simulate no agents in this community; may be repeated. Saves a runtime branch result.
+        #[arg(long)]
+        demo_no_agents_in: Vec<Uuid>,
+        /// Stop after saving one handler outcome, before get_next_stage processes it.
+        #[arg(long)]
+        pause_after_handler: bool,
     },
     /// List synthetic requests, newest first.
     List {
@@ -88,6 +94,8 @@ pub async fn run(command: Command) -> Result<i32> {
             max_stages,
             fail_stage,
             stage_delay_ms,
+            demo_no_agents_in,
+            pause_after_handler,
         } => {
             let code = executor::run(
                 &store,
@@ -97,6 +105,8 @@ pub async fn run(command: Command) -> Result<i32> {
                     max_stages,
                     fail_stage,
                     stage_delay: std::time::Duration::from_millis(stage_delay_ms),
+                    no_agents_in: demo_no_agents_in,
+                    pause_after_handler,
                 },
                 &crate::shutdown_token(),
             )

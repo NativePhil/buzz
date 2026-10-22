@@ -1,9 +1,9 @@
-//! Approval establishes the one saved starting stage; no worker runs here.
+//! Approval records authorization; the transition function initializes execution.
 
 use super::*;
 
 /// A reached stage. Retries will update the same row, not append attempts.
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct EntityStage {
     /// Stable stage-history row identifier.
     pub id: Uuid,
@@ -54,7 +54,7 @@ pub struct EntityInspection {
     pub execution: EntityExecution,
     /// Retained approvals, ordered by approval time and identifier.
     pub approvals: Vec<EntityApproval>,
-    /// History including the current resume position, if approved.
+    /// Reached stages, including the current resume position after execution starts.
     pub stage_history: Vec<EntityStage>,
 }
 
@@ -101,7 +101,7 @@ impl EntityDeletionStore {
         })
     }
 
-    /// Approve an inspected demo inventory and atomically create `gate_user`.
+    /// Record approval of the saved inventory without creating or executing stages.
     ///
     /// An identical retry is read-only. Another operator adds retained evidence
     /// without restarting the workflow. The operator identity is self-asserted and
@@ -123,15 +123,21 @@ impl EntityDeletionStore {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| DbError::NotFound(format!("entity deletion request {id}")))?;
-        // Until real discovery ships, only the exact built-in demo is approvable.
-        let inventory = demo_inventory(&request.target);
-        let digest = inventory_digest(&inventory)?;
-        if request.inventory_manifest.as_ref() != Some(&inventory)
-            || request.inventory_digest.as_deref() != Some(digest.as_str())
-            || expected_inventory_digest != digest
-        {
+        let digest = workflow::validated_inventory_digest(&request)?;
+        if expected_inventory_digest != digest {
             return Err(DbError::DeletionSafety(
-                "inspect the request and approve its saved demo inventory digest; legacy requests need a matching resubmission first".into(),
+                "approval does not match saved inventory".into(),
+            ));
+        }
+        let has_history: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM entity_deletion_stage_history WHERE request_id = $1)",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if has_history {
+            return Err(DbError::DeletionSafety(
+                "approval cannot change a started workflow".into(),
             ));
         }
         if request.status == "approved" {
@@ -146,18 +152,6 @@ impl EntityDeletionStore {
             if !has_approval {
                 return Err(DbError::DeletionSafety(
                     "approved request has no approval for its saved inventory".into(),
-                ));
-            }
-            let has_current: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM entity_deletion_stage_history
-                 WHERE request_id = $1 AND is_current)",
-            )
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
-            if !has_current {
-                return Err(DbError::DeletionSafety(
-                    "approved request has no current stage".into(),
                 ));
             }
             save_approval(&mut tx, id, approved_by, &digest).await?;
@@ -178,15 +172,6 @@ impl EntityDeletionStore {
         .fetch_one(&mut *tx)
         .await?;
         save_approval(&mut tx, id, approved_by, &digest).await?;
-        // An unexpected current row is an error, not an upsert: the whole
-        // transaction must roll back instead of approving inconsistent state.
-        sqlx::query(
-            "INSERT INTO entity_deletion_stage_history (request_id, stage)
-             VALUES ($1, 'gate_user')",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
         tx.commit().await?;
         Ok(request)
     }
