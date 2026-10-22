@@ -111,8 +111,11 @@ pub async fn check_pipeline_hotstart(state: State<'_, AppState>) -> Result<(), S
     //   - React (HuddleContext.tsx): clears list on failure (TTS authorization
     //     must fail-closed — never speak from a stale agent list).
     //
-    // On Ok: always replace (even with empty — agents may have been removed).
-    // On Err: preserve the existing list (transient failure shouldn't zero it).
+    // On a complete roster: replace (even with empty — agents may have been
+    // removed). On an incomplete roster (managed-agent records unreadable):
+    // add the role-proven agents and keep stored agents that are still
+    // members. On Err: preserve the existing list (transient failure shouldn't
+    // zero it).
     if let Some(eph_id) = &ephemeral_channel_id {
         let should_refresh = {
             let hs = state.huddle()?;
@@ -127,10 +130,7 @@ pub async fn check_pipeline_hotstart(state: State<'_, AppState>) -> Result<(), S
             // Only update the throttle timestamp when at least one fetch succeeds,
             // so transient failures retry immediately on the next poll cycle.
             // Fetch both lists before acquiring the lock — no lock held across await.
-            let fresh_agents = fetch_huddle_roster(eph_id, &state)
-                .await
-                .ok()
-                .and_then(|roster| roster.complete_agents());
+            let fresh_agents = fetch_huddle_roster(eph_id, &state).await.ok();
             let fresh_members = fetch_channel_members(eph_id, &state).await.ok();
             let (roster_changed, transcription_auto_enabled) =
                 if fresh_agents.is_some() || fresh_members.is_some() {
@@ -139,13 +139,10 @@ pub async fn check_pipeline_hotstart(state: State<'_, AppState>) -> Result<(), S
                         return Ok(());
                     }
                     let mut roster_changed = false;
-                    if let Some(agents) = fresh_agents {
+                    if let Some(roster) = fresh_agents {
                         let mut current_agents =
                             hs.agent_pubkeys.lock().unwrap_or_else(|e| e.into_inner());
-                        if *current_agents != agents {
-                            *current_agents = agents;
-                            roster_changed = true;
-                        }
+                        roster_changed |= roster.apply_agents(&mut current_agents);
                     }
                     if let Some(members) = fresh_members {
                         if hs.participants != members {
@@ -192,12 +189,7 @@ pub(crate) async fn post_connect_setup(
     // Hydrate agent pubkeys and participants from relay in parallel
     // (authoritative — overrides local guesses).
     let (agents_result, all_members_result) = tokio::join!(
-        async {
-            fetch_huddle_roster(ephemeral_channel_id, state)
-                .await
-                .ok()
-                .and_then(|roster| roster.complete_agents())
-        },
+        async { fetch_huddle_roster(ephemeral_channel_id, state).await.ok() },
         fetch_channel_members(ephemeral_channel_id, state),
     );
     let (roster_changed, transcription_auto_enabled) = {
@@ -206,12 +198,9 @@ pub(crate) async fn post_connect_setup(
             return Ok(PostConnectOutcome::Stale);
         }
         let mut roster_changed = false;
-        if let Some(agents) = agents_result {
+        if let Some(roster) = agents_result {
             let mut current_agents = hs.agent_pubkeys.lock().unwrap_or_else(|e| e.into_inner());
-            if *current_agents != agents {
-                *current_agents = agents;
-                roster_changed = true;
-            }
+            roster_changed |= roster.apply_agents(&mut current_agents);
         }
         if let Ok(all_members) = all_members_result {
             if !all_members.is_empty() && hs.participants != all_members {

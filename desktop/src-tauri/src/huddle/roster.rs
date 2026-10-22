@@ -40,10 +40,34 @@ pub(crate) struct HuddleRoster {
 }
 
 impl HuddleRoster {
-    /// The agent list, only when every member was classified. Use this to
-    /// replace a stored agent list, so a failed read cannot drop agents.
-    pub(crate) fn complete_agents(self) -> Option<Vec<String>> {
-        self.complete.then_some(self.agents)
+    /// Update a stored agent list from this roster. Returns true when the
+    /// list changed.
+    ///
+    /// A complete roster replaces the list. An incomplete roster adds its
+    /// role-proven agents and keeps stored agents that are still members, so
+    /// a failed record read can neither hide a `bot` agent nor drop an agent
+    /// that only a record proved. Stored agents that left the channel drop out.
+    pub(crate) fn apply_agents(self, current: &mut Vec<String>) -> bool {
+        let next = if self.complete {
+            self.agents
+        } else {
+            let mut next: Vec<String> = current
+                .iter()
+                .filter(|pubkey| self.agents.contains(pubkey) || self.humans.contains(pubkey))
+                .cloned()
+                .collect();
+            for agent in self.agents {
+                if !next.contains(&agent) {
+                    next.push(agent);
+                }
+            }
+            next
+        };
+        if *current == next {
+            return false;
+        }
+        *current = next;
+        true
     }
 
     /// The number of people, only when every member was classified. An
@@ -250,12 +274,48 @@ mod tests {
         // Viewer + legacy agent look like two people, but the roster is
         // incomplete, so the leave path must not treat this as "last person".
         assert_eq!(failed.humans_remaining(), None);
-        assert_eq!(failed.complete_agents(), None);
 
         // The next successful read classifies the legacy agent again.
         let recovered = roster_from(&members, Ok(vec![record(&viewer, &legacy)]), &authors);
         assert_eq!(recovered.humans_remaining(), Some(1));
-        assert_eq!(recovered.complete_agents(), Some(vec![attested, legacy]));
+        assert_eq!(recovered.agents, vec![attested, legacy]);
+    }
+
+    #[test]
+    fn failed_record_read_adds_bot_agents_to_stored_state() {
+        let viewer = Keys::generate();
+        let attested = Keys::generate().public_key().to_hex();
+        let legacy = Keys::generate().public_key().to_hex();
+        let members = vec![
+            member(&viewer.public_key().to_hex(), "owner"),
+            member(&attested, "bot"),
+            member(&legacy, "member"),
+        ];
+        let authors = trusted_record_authors(&members, &viewer.public_key().to_hex());
+        let failed = || roster_from(&members, Err("relay down".to_string()), &authors);
+
+        // A joiner starts with no stored agents. The role-proven agent must
+        // still reach state, while the roster cannot end the Huddle.
+        let mut joiner = Vec::new();
+        assert_eq!(failed().humans_remaining(), None);
+        assert!(failed().apply_agents(&mut joiner));
+        assert_eq!(joiner, vec![attested.clone()]);
+
+        // An agent that only a record proved stays through a failed read.
+        let mut stored = vec![legacy.clone(), attested.clone()];
+        assert!(!failed().apply_agents(&mut stored));
+        assert_eq!(stored, vec![legacy.clone(), attested.clone()]);
+
+        // A stored agent that left the channel drops out.
+        let departed = Keys::generate().public_key().to_hex();
+        let mut stale = vec![departed, legacy.clone()];
+        assert!(failed().apply_agents(&mut stale));
+        assert_eq!(stale, vec![legacy.clone(), attested.clone()]);
+
+        // A complete roster replaces the list.
+        let complete = roster_from(&members, Ok(Vec::new()), &authors);
+        assert!(complete.apply_agents(&mut stored));
+        assert_eq!(stored, vec![attested]);
     }
 
     #[test]
