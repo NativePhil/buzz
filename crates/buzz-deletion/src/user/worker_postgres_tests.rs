@@ -11,7 +11,8 @@ async fn fixture() -> (EntityDeletionStore, Uuid, sqlx::PgPool) {
         db.migrate().await.unwrap();
     }
     let store = db.entity_deletion_store();
-    let request = store
+    let request = db
+        .user_deletion_store()
         .submit("demo:runner", "submitter", None)
         .await
         .unwrap();
@@ -259,7 +260,11 @@ async fn dummy_handler_is_heartbeated_and_lease_loss_prevents_completion() {
         .await
         .unwrap()
         .unwrap();
-    let stage = match store.get_next_stage(&lease, None).await.unwrap() {
+    let stage = match UserDeletionTransition::new(&store)
+        .get_next_stage(&lease, None)
+        .await
+        .unwrap()
+    {
         NextStage::Stage(row) => row,
         other => panic!("{other:?}"),
     };
@@ -290,7 +295,11 @@ async fn dummy_handler_is_heartbeated_and_lease_loss_prevents_completion() {
     assert!(after.stage_history[0].is_current);
     assert_eq!(after.stage_history[0].status, "completed");
 
-    let stage = match store.get_next_stage(&lease, None).await.unwrap() {
+    let stage = match UserDeletionTransition::new(&store)
+        .get_next_stage(&lease, None)
+        .await
+        .unwrap()
+    {
         NextStage::Stage(row) => row,
         other => panic!("{other:?}"),
     };
@@ -388,7 +397,11 @@ async fn execute_without_transition(store: &EntityDeletionStore, id: Uuid, optio
         .await
         .unwrap()
         .unwrap();
-    let NextStage::Stage(row) = store.get_next_stage(&lease, None).await.unwrap() else {
+    let NextStage::Stage(row) = UserDeletionTransition::new(store)
+        .get_next_stage(&lease, None)
+        .await
+        .unwrap()
+    else {
         panic!("expected an executable stage");
     };
     handlers::dispatch(store, &lease, &row, options)

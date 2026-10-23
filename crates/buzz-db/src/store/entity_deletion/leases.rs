@@ -120,111 +120,6 @@ impl EntityDeletionStore {
         Ok(())
     }
 
-    /// Start the supplied current stage, preserving its first start time on retry.
-    pub async fn start_stage(&self, lease: &EntityLease, stage_id: Uuid) -> Result<EntityStage> {
-        let mut tx = self.pool.begin().await?;
-        let request = lock_owned(&mut tx, lease).await?;
-        validate_approved_inventory(&mut tx, &request).await?;
-        let stage = current_stage(&mut tx, lease.request_id).await?;
-        if stage.id != stage_id
-            || !matches!(stage.status.as_str(), "pending" | "running" | "failed")
-        {
-            return Err(DbError::DeletionSafety(
-                "stage is no longer executable".into(),
-            ));
-        }
-        let due: bool = sqlx::query_scalar(
-            "SELECT next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()
-             FROM entity_deletion_requests WHERE id = $1",
-        )
-        .bind(lease.request_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if !due {
-            return Err(DbError::DeletionSafety("stage retry is not due".into()));
-        }
-        sqlx::query("UPDATE entity_deletion_requests SET status = 'running', next_attempt_at = NULL WHERE id = $1")
-            .bind(lease.request_id).execute(&mut *tx).await?;
-        let stage = sqlx::query_as(
-            "UPDATE entity_deletion_stage_history
-             SET status = 'running', started_at = COALESCE(started_at, clock_timestamp()),
-                 updated_at = clock_timestamp()
-             WHERE id = $1
-             RETURNING id, request_id, target_community_id, stage, status, is_current,
-                       started_at, finished_at, metadata_json, last_error, updated_at",
-        )
-        .bind(stage.id)
-        .fetch_one(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(stage)
-    }
-
-    /// Record failure and its retry deadline; get_next_stage returns WaitUntil.
-    /// Ownership is released by the worker after it observes that outcome.
-    pub async fn fail_stage(
-        &self,
-        lease: &EntityLease,
-        stage_id: Uuid,
-        message: &str,
-        retry_delay: Duration,
-    ) -> Result<()> {
-        let millis = duration_millis(retry_delay)?;
-        let message: String = message.chars().take(2048).collect();
-        let mut tx = self.pool.begin().await?;
-        lock_owned(&mut tx, lease).await?;
-        require_running_stage(&mut tx, lease, stage_id).await?;
-        sqlx::query(
-            "UPDATE entity_deletion_stage_history
-             SET status = 'failed', last_error = $2, updated_at = clock_timestamp()
-             WHERE id = $1",
-        )
-        .bind(stage_id)
-        .bind(&message)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE entity_deletion_requests
-             SET status = 'retry_wait', retry_count = retry_count + 1, last_error = $2,
-                 next_attempt_at = clock_timestamp() + $3 * interval '1 millisecond',
-                 updated_at = clock_timestamp()
-             WHERE id = $1",
-        )
-        .bind(lease.request_id)
-        .bind(message)
-        .bind(millis)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// Save a handler's result without switching stages. A completed current row
-    /// is the durable journal for a transition that has not committed yet.
-    pub async fn save_stage_success(
-        &self,
-        lease: &EntityLease,
-        stage_id: Uuid,
-        result: serde_json::Value,
-    ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        let request = lock_owned(&mut tx, lease).await?;
-        validate_approved_inventory(&mut tx, &request).await?;
-        require_running_stage(&mut tx, lease, stage_id).await?;
-        sqlx::query(
-            "UPDATE entity_deletion_stage_history SET status = 'completed',
-             finished_at = clock_timestamp(), last_error = NULL,
-             metadata_json = jsonb_set(metadata_json, '{result}', $2),
-             updated_at = clock_timestamp() WHERE id = $1",
-        )
-        .bind(stage_id)
-        .bind(result)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
     /// Release this live claim after a pause or shutdown, without advancing its stage.
     ///
     /// Returns false after ownership loss; never clears a successor's lease.
@@ -273,38 +168,11 @@ pub(super) async fn lock_owned(tx: &mut Tx<'_>, lease: &EntityLease) -> Result<E
     Ok(request)
 }
 
-pub(super) async fn current_stage(tx: &mut Tx<'_>, id: Uuid) -> Result<EntityStage> {
-    let stage: EntityStage = sqlx::query_as(
-        "SELECT id, request_id, target_community_id, stage, status, is_current,
-                started_at, finished_at, metadata_json, last_error, updated_at
-         FROM entity_deletion_stage_history WHERE request_id = $1 AND is_current",
-    )
-    .bind(id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or_else(|| DbError::DeletionSafety("unfinished request has no current stage".into()))?;
-    Ok(stage)
-}
-
-pub(super) async fn require_running_stage(
-    tx: &mut Tx<'_>,
-    lease: &EntityLease,
-    stage_id: Uuid,
-) -> Result<EntityStage> {
-    let stage = current_stage(tx, lease.request_id).await?;
-    if stage.id != stage_id || stage.status != "running" {
-        return Err(DbError::DeletionSafety(
-            "stage is no longer current and running".into(),
-        ));
-    }
-    Ok(stage)
-}
-
 pub(super) async fn validate_approved_inventory(
     tx: &mut Tx<'_>,
     request: &EntityRequest,
 ) -> Result<()> {
-    let digest = workflow::validated_inventory_digest(request)?;
+    let digest = validated_inventory_digest(request)?;
     let approved: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM entity_deletion_approvals
          WHERE request_id = $1 AND inventory_digest = $2)",
@@ -321,7 +189,7 @@ pub(super) async fn validate_approved_inventory(
     Ok(())
 }
 
-fn duration_millis(duration: Duration) -> Result<i64> {
+pub(super) fn duration_millis(duration: Duration) -> Result<i64> {
     if duration.is_zero() || duration > Duration::from_secs(3600) || duration.as_millis() == 0 {
         return Err(DbError::InvalidData(
             "lease/retry duration must be 1ms..1h".into(),
@@ -337,7 +205,3 @@ fn stale_lease(lease: &EntityLease) -> DbError {
         lease.request_id, lease.owner, lease.generation
     ))
 }
-
-#[cfg(test)]
-#[path = "execution_postgres_tests.rs"]
-mod postgres_tests;

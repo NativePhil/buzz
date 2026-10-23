@@ -35,9 +35,10 @@ async fn assert_plain_schema(pool: &PgPool) {
 #[ignore = "requires Postgres"]
 async fn concurrent_submissions_converge_and_conflicts_preserve_request() {
     let store = store().await;
+    let submissions = users(&store);
     let (first, second) = tokio::join!(
-        store.submit("demo:alice", "operator-a", Some("manual test")),
-        store.submit("demo:alice", "operator-a", Some("manual test")),
+        submissions.submit("demo:alice", "operator-a", Some("manual test")),
+        submissions.submit("demo:alice", "operator-a", Some("manual test")),
     );
     let first = first.expect("first submission");
     let second = second.expect("concurrent submission");
@@ -46,11 +47,11 @@ async fn concurrent_submissions_converge_and_conflicts_preserve_request() {
     assert_eq!(first.entity_type, "user");
     assert_eq!(first.created_at, second.created_at);
     assert_eq!(first.updated_at, second.updated_at);
-    assert!(store
+    assert!(users(&store)
         .submit("demo:alice", "operator-b", Some("manual test"))
         .await
         .is_err());
-    assert!(store
+    assert!(users(&store)
         .submit("demo:alice", "operator-a", None)
         .await
         .is_err());
@@ -60,7 +61,7 @@ async fn concurrent_submissions_converge_and_conflicts_preserve_request() {
         serde_json::to_value(first).unwrap()
     );
     assert_eq!(store.list(100).await.expect("list").len(), 1);
-    store
+    users(&store)
         .submit("demo:bob", "operator-a", None)
         .await
         .expect("second target");
@@ -85,22 +86,28 @@ async fn invalid_submissions_do_not_create_rows() {
         "demo:alice@example.com",
     ] {
         assert!(
-            store.submit(target, "operator-a", None).await.is_err(),
+            users(&store)
+                .submit(target, "operator-a", None)
+                .await
+                .is_err(),
             "{target}"
         );
     }
-    assert!(store
+    assert!(users(&store)
         .submit(&format!("demo:{}", "a".repeat(65)), "operator-a", None)
         .await
         .is_err());
     for actor in ["", " operator-a", "operator-a "] {
-        assert!(store.submit("demo:alice", actor, None).await.is_err());
+        assert!(users(&store)
+            .submit("demo:alice", actor, None)
+            .await
+            .is_err());
     }
-    assert!(store
+    assert!(users(&store)
         .submit("demo:alice", &"a".repeat(257), None)
         .await
         .is_err());
-    assert!(store
+    assert!(users(&store)
         .submit("demo:alice", "operator-a", Some(&"a".repeat(4097)))
         .await
         .is_err());
@@ -130,7 +137,7 @@ async fn desired_schema_has_plain_intake_without_database_guards() {
     .execute(&store.pool)
     .await
     .is_err());
-    store
+    users(&store)
         .submit("demo:alice", "operator-a", None)
         .await
         .expect("valid submission");
@@ -161,7 +168,7 @@ async fn migration_schema_entity_intake_preserves_existing_data() {
     .await
     .expect("registry");
     assert!(registered);
-    let request = store
+    let request = users(&store)
         .submit("demo:alice", "operator-a", None)
         .await
         .expect("submit");
@@ -192,7 +199,7 @@ async fn migration_schema_entity_intake_preserves_existing_data() {
 #[ignore = "requires Postgres"]
 async fn approval_is_atomic_idempotent_and_bound_to_inventory() {
     let store = store().await;
-    let request = store
+    let request = users(&store)
         .submit("demo:approval", "operator-a", None)
         .await
         .unwrap();
@@ -230,7 +237,7 @@ async fn approval_is_atomic_idempotent_and_bound_to_inventory() {
         .approve(request.id, "operator-b", digest)
         .await
         .unwrap();
-    store
+    users(&store)
         .submit("demo:approval", "operator-a", None)
         .await
         .unwrap();
@@ -291,7 +298,7 @@ async fn approval_is_atomic_idempotent_and_bound_to_inventory() {
 #[ignore = "requires Postgres"]
 async fn approval_rolls_back_when_evidence_cannot_be_saved() {
     let store = store().await;
-    let request = store
+    let request = users(&store)
         .submit("demo:rollback", "operator-a", None)
         .await
         .unwrap();
@@ -317,7 +324,7 @@ async fn approval_rolls_back_when_evidence_cannot_be_saved() {
 #[ignore = "requires Postgres"]
 async fn approval_refuses_changed_inventory_and_unexpected_stage_history() {
     let store = store().await;
-    let request = store
+    let request = users(&store)
         .submit("demo:changed", "operator-a", None)
         .await
         .unwrap();
@@ -379,7 +386,7 @@ async fn migration_schema_approval_preserves_legacy_intake_and_resubmission_prep
     assert!(before.stage_history.is_empty());
     assert!(before.approvals.is_empty());
     assert!(store.approve(id, "operator-b", "unknown").await.is_err());
-    let prepared = store
+    let prepared = users(&store)
         .submit("demo:legacy", "operator-a", None)
         .await
         .unwrap();
@@ -414,7 +421,7 @@ async fn migration_schema_approval_preserves_legacy_intake_and_resubmission_prep
 #[ignore = "requires Postgres"]
 async fn approval_refuses_to_repair_missing_evidence() {
     let store = store().await;
-    let request = store
+    let request = users(&store)
         .submit("demo:missing-evidence", "operator-a", None)
         .await
         .unwrap();
@@ -437,4 +444,8 @@ async fn approval_refuses_to_repair_missing_evidence() {
         serde_json::to_value(store.inspect(request.id).await.unwrap()).unwrap(),
         serde_json::to_value(before).unwrap()
     );
+}
+
+fn users(store: &EntityDeletionStore) -> crate::user_deletion::UserDeletionStore {
+    Db::from_pool(store.pool.clone()).user_deletion_store()
 }

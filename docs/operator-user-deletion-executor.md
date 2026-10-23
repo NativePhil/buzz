@@ -5,6 +5,49 @@ It never gates a real account or deletes user data. Submit still creates an
 artificial inventory: B (participant), then C (former participant). Only `demo:`
 targets are accepted. Owned communities and production fencing are future work.
 
+## Code map: worker, policy, and persistence
+
+The worker and user-specific routing live in `buzz-deletion`. PostgreSQL
+transactions live in `buzz-db`. Both are libraries in the same CLI process;
+there is no additional service or database-side workflow function.
+
+| File | Responsibility |
+| --- | --- |
+| `buzz-deletion/src/user.rs` | Parse command arguments, call the user/shared stores or worker, print results |
+| `buzz-deletion/src/user/worker.rs` | Claim, heartbeat, call transition, dispatch handler, repeat, release |
+| `buzz-deletion/src/user/handlers.rs` | Dummy actions; save start/result/failure through the shared store |
+| `buzz-deletion/src/user/transition.rs` | `UserDeletionTransition.get_next_stage`: recover or choose the next saved position |
+| `buzz-deletion/src/user/workflow.rs` | Allowed user stages, result-based branching, community-progress reconstruction |
+| `buzz-db/src/store/entity_deletion/mod.rs` | Shared store definition and exports; no stage policy |
+| `buzz-db/src/store/entity_deletion/requests.rs` | Read/list/inspect requests and calculate/verify inventory fingerprints |
+| `buzz-db/src/store/entity_deletion/approvals.rs` | Persist approval evidence and parent status together |
+| `buzz-db/src/store/entity_deletion/leases.rs` | Claim, heartbeat, release, and owner/generation checks |
+| `buzz-db/src/store/entity_deletion/stages.rs` | Save handler outcomes and commit stage transitions atomically |
+| `buzz-db/src/store/user_deletion/mod.rs` | User-specific store definition and exports |
+| `buzz-db/src/store/user_deletion/requests.rs` | Submit user requests and validate user inventory during approval |
+| `buzz-db/src/store/user_deletion/inventory.rs` | Demo target checks, B/C inventory generation, and user inventory validation |
+
+The common store does not know the names `gate_user`, `purge_db`, or
+`purge_agents`. `UserDeletionTransition` supplies a synchronous decision function
+to `EntityDeletionStore.transition_stage`. The store locks the parent and loads
+history, invokes that function while still holding the lock, checks the returned
+operation against the current lifecycle, applies it, and commits. The decision
+function performs no SQL or external work. Returning an error rolls back the
+transaction. This avoids a gap between reading state and saving a decision.
+
+The operations are initialize, resume, advance, and already finished. An advance
+includes the expected completed stage ID, the decision to retain in history,
+and the successor's name, community, and inputs (or no successor for completion).
+The store enforces ownership and current-stage preconditions; the user policy
+ensures that the chosen destination follows the user workflow rules.
+
+User submission and inventory interpretation are deliberately separate from
+common workflow storage, even though they use the same tables. User approval
+runs its inventory validator inside the common approval transaction. Future
+real PostgreSQL deletion operations belong in the user-specific database folder;
+the current handlers still perform no real deletion. Existing community deletion
+continues using its existing implementation.
+
 ## The execution contract
 
 ```text
@@ -19,7 +62,7 @@ run: claim parent request
 The worker owns claiming, heartbeats, shutdown, dispatch, and a bounded execution
 budget. It does not inspect handler results, reconstruct community progress, or
 choose branches. `get_next_stage` owns all those decisions. Specific rules live
-in its private `workflow.rs` module; the transition transaction contains no
+in `user/workflow.rs`; the database transition transaction contains no
 stage-name comparisons or two-community requirement.
 
 The handler gets the whole row. `metadata_json.inputs` holds the target and

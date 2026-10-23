@@ -1,88 +1,14 @@
-//! Versioned user-workflow rules. The executor and transition transaction do not
-//! embed stage names or a fixed number of communities.
-
+//! User stage rules and recovery of community progress; no SQL.
+use buzz_db::entity_deletion::{EntityRequest, EntityStage};
+use buzz_db::user_deletion::UserDeletionInventory as Inventory;
+use buzz_db::{DbError, Result};
+use serde::Serialize;
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-
-use serde_json::{json, Value};
-
-use super::*;
-
+use uuid::Uuid;
 pub(super) fn invalid(message: &str) -> DbError {
     DbError::DeletionSafety(message.into())
 }
-
-pub(super) struct Inventory {
-    pub communities: Vec<(Uuid, Value)>,
-}
-
-impl Inventory {
-    pub fn read(request: &EntityRequest) -> Result<Self> {
-        validate_submission(
-            &request.target,
-            &request.requested_by,
-            request.reason.as_deref(),
-        )?;
-        let value = request
-            .inventory_manifest
-            .as_ref()
-            .ok_or_else(|| invalid("missing inventory"))?;
-        if value["version"] != 1 || value["target"] != request.target {
-            return Err(invalid("unsupported inventory version or target"));
-        }
-        let rows = value["communities"]
-            .as_array()
-            .ok_or_else(|| invalid("missing communities"))?;
-        if rows.len() > 1000 {
-            return Err(invalid("inventory exceeds 1000 communities"));
-        }
-        let mut seen = HashSet::new();
-        let mut communities = Vec::new();
-        for row in rows {
-            let id = row["community_id"]
-                .as_str()
-                .and_then(|s| Uuid::parse_str(s).ok())
-                .ok_or_else(|| invalid("invalid inventory community id"))?;
-            if !seen.insert(id)
-                || row["action"] != "delete_subject_data"
-                || !matches!(
-                    row["relationship"].as_str(),
-                    Some("participant" | "former_participant")
-                )
-            {
-                return Err(invalid("duplicate community or unsupported deletion scope"));
-            }
-            communities.push((id, row.clone()));
-        }
-        Ok(Self { communities })
-    }
-
-    pub fn inputs(&self, target: &str, community: Option<Uuid>) -> Result<Value> {
-        let community = match community {
-            None => Value::Null,
-            Some(id) => self
-                .communities
-                .iter()
-                .find(|(key, _)| *key == id)
-                .map(|(_, value)| value.clone())
-                .ok_or_else(|| invalid("stage community is outside inventory"))?,
-        };
-        Ok(json!({"target": target, "community": community}))
-    }
-}
-
-pub(super) fn validated_inventory_digest(request: &EntityRequest) -> Result<String> {
-    Inventory::read(request)?;
-    let inventory = request
-        .inventory_manifest
-        .as_ref()
-        .ok_or_else(|| invalid("missing inventory"))?;
-    let digest = inventory_digest(inventory)?;
-    if request.inventory_digest.as_deref() != Some(&digest) {
-        return Err(invalid("saved inventory digest changed"));
-    }
-    Ok(digest)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", content = "stage", rename_all = "snake_case")]
 pub(super) enum Decision {

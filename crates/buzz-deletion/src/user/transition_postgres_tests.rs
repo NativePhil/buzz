@@ -1,10 +1,56 @@
 use super::*;
+use buzz_db::Db;
+use serde_json::Value;
+use sqlx::PgPool;
+use std::time::Duration;
 
-async fn fixture() -> (EntityDeletionStore, Uuid) {
-    let store = EntityDeletionStore {
-        pool: PgPool::connect(&crate::test_support::database_url())
+// This fixture exposes the real stores and transition component. It contains
+// no routing rules; each helper delegates to the production API.
+struct TestStore {
+    store: EntityDeletionStore,
+    pool: PgPool,
+}
+impl std::ops::Deref for TestStore {
+    type Target = EntityDeletionStore;
+    fn deref(&self) -> &Self::Target {
+        &self.store
+    }
+}
+impl TestStore {
+    async fn submit(
+        &self,
+        target: &str,
+        operator: &str,
+        reason: Option<&str>,
+    ) -> Result<EntityRequest> {
+        Db::from_pool(self.pool.clone())
+            .user_deletion_store()
+            .submit(target, operator, reason)
             .await
-            .unwrap(),
+    }
+    async fn get_next_stage(
+        &self,
+        lease: &EntityLease,
+        previous: Option<Uuid>,
+    ) -> Result<NextStage> {
+        UserDeletionTransition::new(&self.store)
+            .get_next_stage(lease, previous)
+            .await
+    }
+}
+fn inventory_digest(value: &Value) -> Result<String> {
+    // Use the same public fingerprint operation as request preparation.
+    buzz_db::entity_deletion::inventory_digest(value)
+}
+
+async fn fixture() -> (TestStore, Uuid) {
+    let url = std::env::var("BUZZ_TEST_DATABASE_URL")
+        .or_else(|_| std::env::var("DATABASE_URL"))
+        .unwrap();
+    let pool = PgPool::connect(&url).await.unwrap();
+    let store = TestStore {
+        store: Db::from_pool(pool.clone()).entity_deletion_store(),
+        pool,
     };
     let request = store
         .submit("demo:executor", "submitter", None)
@@ -21,7 +67,7 @@ async fn fixture() -> (EntityDeletionStore, Uuid) {
     (store, request.id)
 }
 
-async fn claim(store: &EntityDeletionStore, id: Uuid, owner: &str) -> EntityLease {
+async fn claim(store: &TestStore, id: Uuid, owner: &str) -> EntityLease {
     store
         .claim(id, owner, Duration::from_secs(60))
         .await
@@ -29,7 +75,7 @@ async fn claim(store: &EntityDeletionStore, id: Uuid, owner: &str) -> EntityLeas
         .unwrap()
 }
 
-async fn snapshot(store: &EntityDeletionStore, id: Uuid) -> serde_json::Value {
+async fn snapshot(store: &TestStore, id: Uuid) -> serde_json::Value {
     serde_json::to_value(store.inspect(id).await.unwrap()).unwrap()
 }
 
@@ -80,7 +126,7 @@ async fn expired_and_superseded_workers_cannot_change_any_execution_state() {
     sqlx::query("UPDATE entity_deletion_requests SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1")
         .bind(id).execute(&store.pool).await.unwrap();
     // Expiration alone rejects renewal, even before another worker claims.
-    assert!(crate::deletion::is_stale_deletion_lease(
+    assert!(buzz_db::deletion::is_stale_deletion_lease(
         &store
             .heartbeat(&old, Duration::from_secs(60))
             .await
@@ -109,7 +155,10 @@ async fn expired_and_superseded_workers_cannot_change_any_execution_state() {
             .await
             .unwrap_err(),
     ] {
-        assert!(crate::deletion::is_stale_deletion_lease(&error), "{error}");
+        assert!(
+            buzz_db::deletion::is_stale_deletion_lease(&error),
+            "{error}"
+        );
     }
     assert!(!store.release(&old).await.unwrap());
     assert_eq!(snapshot(&store, id).await, before);
@@ -147,23 +196,19 @@ async fn heartbeat_checks_authority_after_waiting_for_parent_lock() {
             .is_err()
     );
     blocker.commit().await.unwrap();
-    assert!(crate::deletion::is_stale_deletion_lease(
+    assert!(buzz_db::deletion::is_stale_deletion_lease(
         &renewal.await.unwrap_err()
     ));
 }
 
-async fn next(
-    store: &EntityDeletionStore,
-    lease: &EntityLease,
-    previous: Option<Uuid>,
-) -> EntityStage {
+async fn next(store: &TestStore, lease: &EntityLease, previous: Option<Uuid>) -> EntityStage {
     match store.get_next_stage(lease, previous).await.unwrap() {
         NextStage::Stage(row) => row,
         other => panic!("expected a stage, got {other:?}"),
     }
 }
 
-async fn start(store: &EntityDeletionStore, lease: &EntityLease) -> Result<EntityStage> {
+async fn start(store: &TestStore, lease: &EntityLease) -> Result<EntityStage> {
     match store.get_next_stage(lease, None).await? {
         NextStage::Stage(row) => store.start_stage(lease, row.id).await,
         _ => panic!("expected current stage"),

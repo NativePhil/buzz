@@ -8510,7 +8510,7 @@ DROP FUNCTION community_write_fence_excluded_table(NAME);
         // Operator workflow history is retained even when its provenance
         // community is purged; it is not a tenant-owned serving table.
         let entity = db
-            .entity_deletion_store()
+            .user_deletion_store()
             .submit("demo:history-retention", "operator", None)
             .await
             .unwrap();

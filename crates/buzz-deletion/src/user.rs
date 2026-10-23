@@ -73,7 +73,7 @@ pub async fn run(command: Command) -> Result<i32> {
             requested_by,
             reason,
         } => crate::print_json(
-            &store
+            &db.user_deletion_store()
                 .submit(&target, &requested_by, reason.as_deref())
                 .await?,
         )?,
@@ -82,7 +82,9 @@ pub async fn run(command: Command) -> Result<i32> {
             approved_by,
             inventory_digest,
         } => {
-            store.approve(id, &approved_by, &inventory_digest).await?;
+            db.user_deletion_store()
+                .approve(id, &approved_by, &inventory_digest)
+                .await?;
             crate::print_json(&store.inspect(id).await?)?;
         }
         Command::Run {
@@ -93,11 +95,11 @@ pub async fn run(command: Command) -> Result<i32> {
             stage_delay_ms,
             demo_no_agents_in,
         } => {
-            let code = executor::run(
+            let code = worker::run(
                 &store,
                 id,
                 &executor_id.unwrap_or_else(crate::default_executor_id),
-                &executor::RunOptions {
+                &worker::RunOptions {
                     next_step,
                     fail_stage,
                     stage_delay: std::time::Duration::from_millis(stage_delay_ms),
@@ -115,4 +117,7 @@ pub async fn run(command: Command) -> Result<i32> {
     Ok(0)
 }
 
-mod executor;
+mod handlers;
+mod transition;
+mod worker;
+mod workflow;

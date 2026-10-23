@@ -7,7 +7,8 @@ use buzz_db::entity_deletion::{EntityDeletionStore, EntityLease, EntityStage, Ne
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{StageOutcome, DEFAULT_LEASE_DURATION, HEARTBEAT_INTERVAL, RETRY_DELAY};
+use super::{handlers, transition::UserDeletionTransition};
+use crate::{StageOutcome, DEFAULT_LEASE_DURATION, HEARTBEAT_INTERVAL};
 
 /// Controls for a synthetic run. Delays and failures never invoke real deletion.
 pub(super) struct RunOptions {
@@ -52,6 +53,7 @@ async fn execute_claim(
     options: &RunOptions,
     shutdown: &CancellationToken,
 ) -> Result<i32> {
+    let transition = UserDeletionTransition::new(store);
     let mut previous_stage_id = None;
     let mut executed = 0;
     // Keep ordinary runs bounded; stepping uses the same transition boundary.
@@ -60,7 +62,7 @@ async fn execute_claim(
         if shutdown.is_cancelled() {
             return Ok(0);
         }
-        match store.get_next_stage(lease, previous_stage_id).await? {
+        match transition.get_next_stage(lease, previous_stage_id).await? {
             NextStage::Finished => return Ok(0),
             NextStage::WaitUntil(deadline) => {
                 eprintln!("request {} waits until {deadline}", lease.request_id);
@@ -122,7 +124,6 @@ async fn run_stage_with_heartbeat(
     }
 }
 
-mod handlers;
-
 #[cfg(test)]
+#[path = "worker_postgres_tests.rs"]
 mod postgres_tests;

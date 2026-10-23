@@ -1,6 +1,10 @@
 //! Dummy handlers read full saved rows and persist outcomes; they never route.
 
-use super::*;
+use super::worker::RunOptions;
+use crate::RETRY_DELAY;
+use anyhow::{bail, Result};
+use buzz_db::entity_deletion::{EntityDeletionStore, EntityLease, EntityStage};
+use uuid::Uuid;
 
 pub(super) async fn dispatch(
     store: &EntityDeletionStore,
