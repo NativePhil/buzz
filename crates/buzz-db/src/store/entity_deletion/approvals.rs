@@ -1,4 +1,5 @@
 //! Approval evidence bound to the saved inventory fingerprint.
+use super::requests::REQUEST_COLUMNS;
 use super::*;
 
 /// One retained approval of a particular request inventory.
@@ -44,11 +45,10 @@ impl EntityDeletionStore {
     {
         validate_operator(approved_by)?;
         let mut tx = self.pool.begin().await?;
-        let request: EntityRequest = sqlx::query_as(
-            "SELECT id, entity_type, target, status, requested_by, reason, created_at, updated_at,
-                    inventory_manifest, inventory_digest
+        let request: EntityRequest = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {REQUEST_COLUMNS}
              FROM entity_deletion_requests WHERE id = $1 FOR UPDATE",
-        )
+        )))
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
@@ -92,13 +92,12 @@ impl EntityDeletionStore {
         if request.status != "inventoried" {
             return Err(DbError::DeletionSafety("request is not inventoried".into()));
         }
-        let request = sqlx::query_as(
+        let request = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "UPDATE entity_deletion_requests
              SET status = 'approved', updated_at = now()
              WHERE id = $1
-             RETURNING id, entity_type, target, status, requested_by, reason, created_at,
-                       updated_at, inventory_manifest, inventory_digest",
-        )
+             RETURNING {REQUEST_COLUMNS}",
+        )))
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;

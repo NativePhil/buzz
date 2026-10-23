@@ -4,7 +4,7 @@ use super::{
     UserDeletionStore,
 };
 use crate::entity_deletion::EntityRequest;
-use crate::store::entity_deletion::requests::inventory_digest;
+use crate::store::entity_deletion::requests::{inventory_digest, REQUEST_COLUMNS};
 use crate::{DbError, Result};
 impl UserDeletionStore {
     /// Save a request or return an identical previous submission.
@@ -29,11 +29,10 @@ impl UserDeletionStore {
         .bind(reason)
         .execute(&mut *tx)
         .await?;
-        let mut request: EntityRequest = sqlx::query_as(
-            "SELECT id, entity_type, target, status, requested_by, reason, created_at, updated_at,
-                    inventory_manifest, inventory_digest
+        let mut request: EntityRequest = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {REQUEST_COLUMNS}
              FROM entity_deletion_requests WHERE entity_type = 'user' AND target = $1 FOR UPDATE",
-        )
+        )))
         .bind(target)
         .fetch_one(&mut *tx)
         .await?;
@@ -46,14 +45,13 @@ impl UserDeletionStore {
         if request.status == "submitted" {
             let inventory = demo_inventory(target);
             let digest = inventory_digest(&inventory)?;
-            request = sqlx::query_as(
+            request = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "UPDATE entity_deletion_requests
                  SET status = 'inventoried', inventory_manifest = $2, inventory_digest = $3,
                      updated_at = now()
                  WHERE id = $1
-                 RETURNING id, entity_type, target, status, requested_by, reason, created_at,
-                           updated_at, inventory_manifest, inventory_digest",
-            )
+                 RETURNING {REQUEST_COLUMNS}",
+            )))
             .bind(request.id)
             .bind(inventory)
             .bind(digest)

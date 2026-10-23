@@ -286,3 +286,19 @@ expiry advance every ten seconds. A competing worker is refused. Ctrl-C stops
 execution and releases ownership; the interrupted row remains current. After
 an abrupt process kill, wait for the saved lease expiry before running another
 worker. It resumes the same unfinished row with a higher generation.
+
+## Rollout, recovery, and retained demo data
+
+Migrations 0069–0070 are additive. The serving relay does not schedule these
+requests; only an operator explicitly running the demo CLI executes them.
+
+The Helm chart defaults `migrate.autoMigrate=true`. After these migrations are
+applied, rolling back to a binary that does not contain them fails at startup
+with sqlx `VersionMissing`. For this rollout, recover by rolling forward to a
+corrected binary that retains migrations 0069–0070. Do not remove migration
+records or change their checksums to force an older binary to start. An older
+binary deployed with auto-migration disabled requires a separately verified
+schema-compatibility plan; it is not the recovery procedure assumed here.
+
+Demo request rows, approval evidence, and stage history are deliberately retained
+for inspection. This scaffold has no cleanup command or automatic retention job.

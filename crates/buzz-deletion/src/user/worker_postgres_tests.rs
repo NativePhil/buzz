@@ -303,30 +303,60 @@ async fn dummy_handler_is_heartbeated_and_lease_loss_prevents_completion() {
         NextStage::Stage(row) => row,
         other => panic!("{other:?}"),
     };
-    sqlx::query("UPDATE entity_deletion_requests SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1")
-        .bind(id).execute(&pool).await.unwrap();
     let delayed = RunOptions {
         stage_delay: Duration::from_secs(60),
         ..options()
     };
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(5),
-        run_stage_with_heartbeat(
-            &store,
-            &lease,
-            &stage,
-            &delayed,
-            &CancellationToken::new(),
-            Duration::from_millis(10),
-        ),
-    )
+    let shutdown = CancellationToken::new();
+    let work = run_stage_with_heartbeat(
+        &store,
+        &lease,
+        &stage,
+        &delayed,
+        &shutdown,
+        Duration::from_millis(10),
+    );
+    tokio::pin!(work);
+    // Lose the lease while the handler is already running, not before start_stage.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                _ = &mut work => panic!("handler finished before takeover"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    if store.inspect(id).await.unwrap().stage_history[1].status == "running" {
+                        break;
+                    }
+                }
+            }
+        }
+    })
     .await
     .unwrap();
+    let takeover = async {
+        sqlx::query("UPDATE entity_deletion_requests SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1")
+            .bind(id).execute(&pool).await.unwrap();
+        store
+            .claim(id, "worker", DEFAULT_LEASE_DURATION)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    // Keep polling renewal while takeover waits for the parent lock; an
+    // in-flight heartbeat must be allowed to commit and release that lock.
+    let (outcome, replacement) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(&mut work, takeover)
+    })
+    .await
+    .unwrap();
+    assert_eq!(replacement.generation, lease.generation + 1);
     assert!(matches!(outcome, StageOutcome::Failed(_)));
     let after = store.inspect(id).await.unwrap();
     assert_eq!(after.stage_history.len(), 2);
-    assert_eq!(after.stage_history[1].status, "pending");
+    assert_eq!(after.stage_history[1].status, "running");
     assert!(after.stage_history[1].finished_at.is_none());
+    assert_eq!(after.execution.lease_generation, replacement.generation);
+    assert_eq!(after.execution.lease_owner.as_deref(), Some("worker"));
+    assert!(store.release(&replacement).await.unwrap());
 }
 
 #[tokio::test]

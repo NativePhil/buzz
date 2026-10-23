@@ -35,15 +35,17 @@ pub(super) async fn run(
     // This generation-checked release is harmless after completion, a recorded
     // failure, or takeover. Never leave a background heartbeat running on return.
     let released = store.release(&lease).await;
-    match result {
-        Err(error) => {
-            released?;
-            Err(error)
-        }
-        Ok(code) => {
-            released?;
-            Ok(code)
-        }
+    finish_claim(result, released)
+}
+
+fn finish_claim(result: Result<i32>, released: buzz_db::Result<bool>) -> Result<i32> {
+    match (result, released) {
+        (Err(error), Err(release_error)) => Err(error.context(format!(
+            "also failed to release deletion lease: {release_error}"
+        ))),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Ok(code), Ok(_)) => Ok(code),
     }
 }
 
@@ -105,7 +107,6 @@ async fn run_stage_with_heartbeat(
     tokio::pin!(handler);
     let mut interval = tokio::time::interval(heartbeat_period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let heartbeat_lost = CancellationToken::new();
     // Poll renewal alongside the handler. Awaiting renewal inside a selected
     // timer branch would stop polling a handler that may hold the parent lock.
     // Both futures live here, so cancellation leaves no detached heartbeat task.
@@ -119,7 +120,11 @@ async fn run_stage_with_heartbeat(
     };
     tokio::select! {
         biased;
-        result = crate::await_stage(&mut handler, shutdown, &heartbeat_lost) => result,
+        _ = shutdown.cancelled() => StageOutcome::Shutdown,
+        result = &mut handler => match result {
+            Ok(()) => StageOutcome::Completed,
+            Err(error) => StageOutcome::Failed(error),
+        },
         error = renewal => StageOutcome::Failed(error.into()),
     }
 }
@@ -127,3 +132,35 @@ async fn run_stage_with_heartbeat(
 #[cfg(test)]
 #[path = "worker_postgres_tests.rs"]
 mod postgres_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_failure_preserves_execution_error_and_reports_both() {
+        let original = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "handler failed");
+        let error = finish_claim(
+            Err(original.into()),
+            Err(buzz_db::DbError::InvalidData("release failed".into())),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        let report = format!("{error:#}");
+        assert!(report.contains("handler failed"));
+        assert!(report.contains("release failed"));
+    }
+
+    #[test]
+    fn release_failure_after_success_is_not_swallowed() {
+        assert!(finish_claim(
+            Ok(0),
+            Err(buzz_db::DbError::InvalidData("release failed".into()))
+        )
+        .is_err());
+        assert_eq!(finish_claim(Ok(1), Ok(false)).unwrap(), 1);
+    }
+}

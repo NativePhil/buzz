@@ -1,6 +1,13 @@
 //! Shared request reads, inventory fingerprints, and consistent inspection.
 use super::*;
 use sha2::{Digest, Sha256};
+
+// Shared by SELECT and RETURNING queries that decode EntityRequest.
+// This constant is the only SQL interpolation; all request values stay bound.
+pub(crate) const REQUEST_COLUMNS: &str =
+    "id, entity_type, target, status, requested_by, reason, created_at,
+     updated_at, inventory_manifest, inventory_digest";
+
 /// A demonstration request; approval authorizes only the synthetic workflow.
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct EntityRequest {
@@ -47,11 +54,10 @@ impl EntityDeletionStore {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .execute(&mut *tx)
             .await?;
-        let request = sqlx::query_as(
-            "SELECT id, entity_type, target, status, requested_by, reason, created_at, updated_at,
-                    inventory_manifest, inventory_digest
+        let request = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {REQUEST_COLUMNS}
              FROM entity_deletion_requests WHERE id = $1",
-        )
+        )))
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
@@ -85,11 +91,10 @@ impl EntityDeletionStore {
 
     /// Load a request from the authoritative writer database.
     pub async fn get(&self, id: Uuid) -> Result<EntityRequest> {
-        sqlx::query_as(
-            "SELECT id, entity_type, target, status, requested_by, reason, created_at, updated_at,
-                    inventory_manifest, inventory_digest
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {REQUEST_COLUMNS}
              FROM entity_deletion_requests WHERE id = $1",
-        )
+        )))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?
@@ -98,11 +103,10 @@ impl EntityDeletionStore {
 
     /// List up to 1,000 requests, newest first.
     pub async fn list(&self, limit: u16) -> Result<Vec<EntityRequest>> {
-        Ok(sqlx::query_as(
-            "SELECT id, entity_type, target, status, requested_by, reason, created_at, updated_at,
-                    inventory_manifest, inventory_digest
+        Ok(sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {REQUEST_COLUMNS}
              FROM entity_deletion_requests ORDER BY created_at DESC, id LIMIT $1",
-        )
+        )))
         .bind(i64::from(limit.clamp(1, 1000)))
         .fetch_all(&self.pool)
         .await?)

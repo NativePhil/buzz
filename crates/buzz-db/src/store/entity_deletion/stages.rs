@@ -252,8 +252,13 @@ impl EntityDeletionStore {
                     ));
                 }
                 let row = insert_stage(&mut tx, request.id, None, stage).await?;
-                sqlx::query("UPDATE entity_deletion_requests SET status = 'running', updated_at = clock_timestamp() WHERE id = $1")
-                    .bind(request.id).execute(&mut *tx).await?;
+                sqlx::query(
+                    "UPDATE entity_deletion_requests
+                     SET status = 'running', updated_at = clock_timestamp() WHERE id = $1",
+                )
+                .bind(request.id)
+                .execute(&mut *tx)
+                .await?;
                 NextStage::Stage(row)
             }
             StageTransition::Resume(id) => {
@@ -267,8 +272,12 @@ impl EntityDeletionStore {
                     "failed" => {
                         let retry: Option<(DateTime<Utc>, bool)> = sqlx::query_as(
                             "SELECT next_attempt_at, next_attempt_at > clock_timestamp()
-                             FROM entity_deletion_requests WHERE id = $1 AND status = 'retry_wait' AND next_attempt_at IS NOT NULL",
-                        ).bind(request.id).fetch_optional(&mut *tx).await?;
+                             FROM entity_deletion_requests
+                             WHERE id = $1 AND status = 'retry_wait' AND next_attempt_at IS NOT NULL",
+                        )
+                        .bind(request.id)
+                        .fetch_optional(&mut *tx)
+                        .await?;
                         let (deadline, waiting) =
                             retry.ok_or_else(|| invalid("failed stage has no retry record"))?;
                         return Ok(if waiting {
@@ -337,7 +346,13 @@ async fn insert_stage(
          VALUES ($1, $2, $3, $4)
          RETURNING id, request_id, target_community_id, stage, status, is_current,
                    started_at, finished_at, metadata_json, last_error, updated_at",
-    ).bind(request_id).bind(stage.community).bind(stage.stage).bind(metadata).fetch_one(&mut **tx).await?)
+    )
+    .bind(request_id)
+    .bind(stage.community)
+    .bind(stage.stage)
+    .bind(metadata)
+    .fetch_one(&mut **tx)
+    .await?)
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use super::requests::REQUEST_COLUMNS;
 use super::*;
 
 pub(super) type Tx<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
@@ -63,15 +64,14 @@ impl EntityDeletionStore {
         validate_operator(owner)?;
         let millis = duration_millis(lease_duration)?;
         let mut tx = self.pool.begin().await?;
-        let request: Option<EntityRequest> = sqlx::query_as(
-            "SELECT id, entity_type, target, status, requested_by, reason, created_at,
-                    updated_at, inventory_manifest, inventory_digest
+        let request: Option<EntityRequest> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {REQUEST_COLUMNS}
              FROM entity_deletion_requests
              WHERE id = $1 AND status IN ('approved', 'running', 'retry_wait')
                AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())
                AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp())
              FOR UPDATE SKIP LOCKED",
-        )
+        )))
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
@@ -143,11 +143,10 @@ impl EntityDeletionStore {
 pub(super) async fn lock_owned(tx: &mut Tx<'_>, lease: &EntityLease) -> Result<EntityRequest> {
     // Lock by id first, then check expiry after any wait for that lock. An old
     // snapshot/transaction start time must not extend a worker's authority.
-    let request: EntityRequest = sqlx::query_as(
-        "SELECT id, entity_type, target, status, requested_by, reason, created_at,
-                updated_at, inventory_manifest, inventory_digest
+    let request: EntityRequest = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {REQUEST_COLUMNS}
          FROM entity_deletion_requests WHERE id = $1 FOR UPDATE",
-    )
+    )))
     .bind(lease.request_id)
     .fetch_optional(&mut **tx)
     .await?

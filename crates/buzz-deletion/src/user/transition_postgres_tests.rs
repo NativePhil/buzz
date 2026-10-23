@@ -133,7 +133,9 @@ async fn expired_and_superseded_workers_cannot_change_any_execution_state() {
             .unwrap_err()
     ));
     assert!(!store.release(&old).await.unwrap());
-    let new = claim(&store, id, "worker-b").await;
+    // Reusing the same executor ID isolates the generation check from owner checks.
+    let new = claim(&store, id, "worker-a").await;
+    assert_eq!(new.owner, old.owner);
     assert_eq!(new.generation, old.generation + 1);
     let resumed = start(&store, &new).await.unwrap();
     assert_eq!(resumed.id, stage.id);
@@ -438,6 +440,22 @@ async fn corrupt_inventory_history_and_results_fail_without_inventing_progress()
         .await
         .unwrap();
     let db = next(&store, &lease, Some(gate.id)).await;
+    let saved_transition =
+        store.inspect(id).await.unwrap().stage_history[0].metadata_json["transition"].clone();
+    sqlx::query("UPDATE entity_deletion_stage_history SET metadata_json = jsonb_set(metadata_json, '{transition}', $2) WHERE id = $1")
+        .bind(gate.id).bind(serde_json::json!({"kind": "community_complete"}))
+        .execute(&store.pool).await.unwrap();
+    let corrupted = snapshot(&store, id).await;
+    let error = store
+        .get_next_stage(&lease, Some(gate.id))
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("saved transition disagrees with handler result"));
+    assert_eq!(snapshot(&store, id).await, corrupted);
+    sqlx::query("UPDATE entity_deletion_stage_history SET metadata_json = jsonb_set(metadata_json, '{transition}', $2) WHERE id = $1")
+        .bind(gate.id).bind(saved_transition).execute(&store.pool).await.unwrap();
     store.start_stage(&lease, db.id).await.unwrap();
     store
         .save_stage_success(&lease, db.id, serde_json::json!({}))
