@@ -335,11 +335,18 @@ async fn dummy_handler_is_heartbeated_and_lease_loss_prevents_completion() {
     let takeover = async {
         sqlx::query("UPDATE entity_deletion_requests SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1")
             .bind(id).execute(&pool).await.unwrap();
-        store
-            .claim(id, "worker", DEFAULT_LEASE_DURATION)
-            .await
-            .unwrap()
-            .unwrap()
+        // Claim uses SKIP LOCKED; an in-flight heartbeat may still own the row.
+        // The enclosing timeout bounds this retry, while join keeps work polled.
+        loop {
+            if let Some(replacement) = store
+                .claim(id, "worker", DEFAULT_LEASE_DURATION)
+                .await
+                .unwrap()
+            {
+                break replacement;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     };
     // Keep polling renewal while takeover waits for the parent lock; an
     // in-flight heartbeat must be allowed to commit and release that lock.
