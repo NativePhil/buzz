@@ -157,7 +157,7 @@ This section describes an optional text convention, after [AgentMemoryRepo](http
 
 A line in `profile` or `value` MAY end with inline metadata of the form `[key: value; key: value]`. Keys are open. Two are recommended:
 
-- `source` — a link to where the information was learned, such as the message it came from or a URL.
+- `source` — where the information was learned: preferably a link, such as the message it came from or a URL; otherwise a file path (with its commit, for repository files) or the command whose output showed it.
 - `added` — the date the line was stored, as `YYYY-MM-DD`.
 
 ```
