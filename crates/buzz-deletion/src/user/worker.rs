@@ -40,9 +40,12 @@ pub(super) async fn run(
 
 fn finish_claim(result: Result<i32>, released: buzz_db::Result<bool>) -> Result<i32> {
     match (result, released) {
-        (Err(error), Err(release_error)) => Err(error.context(format!(
-            "also failed to release deletion lease: {release_error}"
-        ))),
+        (Err(error), Err(release_error)) => {
+            // buzz-admin prints Display, so the outer message must include both.
+            let message =
+                format!("{error:#}; also failed to release deletion lease: {release_error}");
+            Err(error.context(message))
+        }
         (Err(error), Ok(_)) => Err(error),
         (Ok(_), Err(error)) => Err(error.into()),
         (Ok(code), Ok(_)) => Ok(code),
@@ -149,7 +152,7 @@ mod tests {
             error.downcast_ref::<std::io::Error>().unwrap().kind(),
             std::io::ErrorKind::BrokenPipe
         );
-        let report = format!("{error:#}");
+        let report = error.to_string();
         assert!(report.contains("handler failed"));
         assert!(report.contains("release failed"));
     }
