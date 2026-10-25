@@ -20,6 +20,7 @@ extension _ChannelSnapshots on ChannelsNotifier {
       _hiddenDmIds = Set.unmodifiable(snapshot.hiddenDmIds);
       _hasLoaded = true;
       _hasCachedSnapshot = true;
+      _needsSnapshotRevalidation = true;
       return channels;
     } catch (_) {
       unawaited(

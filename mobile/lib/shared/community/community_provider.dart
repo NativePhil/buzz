@@ -14,6 +14,7 @@ import '../push/push_bridge.dart';
 import '../push/push_lease_revocation_outbox.dart';
 import '../push/push_subscription.dart';
 import '../relay/signed_event_relay.dart';
+import '../relay/relay_provider.dart' show pubkeyFromNsec;
 import 'community.dart';
 import 'community_storage.dart';
 
@@ -249,6 +250,7 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
   Future<List<Community>> build() async {
     final storage = ref.read(communityStorageProvider);
     final communities = await storage.loadAll();
+    await _removeOrphanChannelListSnapshots(communities);
     await syncCommunitySnapshot(ref, communities);
     return communities;
   }
@@ -274,10 +276,12 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
         pubkey: community.pubkey,
         nsec: community.nsec,
       );
+      await _removeChannelListSnapshot(existing);
       await storage.save(updated);
       final updatedList = [...current];
       updatedList[existingIndex] = updated;
       state = AsyncData(updatedList);
+      await _removeOrphanChannelListSnapshots(updatedList);
       await syncCommunitySnapshot(ref, updatedList);
       return existing.id;
     }
@@ -285,6 +289,7 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
     await storage.save(community);
     final updatedList = [...current, community];
     state = AsyncData(updatedList);
+    await _removeOrphanChannelListSnapshots(updatedList);
     await syncCommunitySnapshot(ref, updatedList);
     return community.id;
   }
@@ -315,20 +320,18 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
         (community) => community.id == id,
       );
       if (removedIndex >= 0) {
+        await _removeChannelListSnapshot(current[removedIndex]);
         // Persist every remote-cleanup dependency before erasing credentials.
         // This local transaction is the only removal prerequisite. Relay I/O
         // starts after the community and NSE snapshot have been removed.
         revocationJournaled = await ref.read(
           communityPushLeaseRevocationEnqueuerProvider,
         )(current[removedIndex]);
-        // Delete cached channel names before credentials, so a failure here
-        // leaves the community removable rather than orphaning the cache.
-        // Removal also retires every write token captured before it.
-        await _removeChannelListSnapshot(current[removedIndex]);
       }
       await storage.remove(id);
 
       final updatedList = current.where((w) => w.id != id).toList();
+      await _removeOrphanChannelListSnapshots(updatedList);
       state = AsyncData(updatedList);
       await syncCommunitySnapshot(ref, updatedList);
 
@@ -360,12 +363,37 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
     });
   }
 
+  String? _channelSnapshotPubkey(Community community) =>
+      pubkeyFromNsec(community.nsec?.trim()) ?? community.pubkey;
+
   Future<void> _removeChannelListSnapshot(Community community) async {
     final snapshots = ref.read(channelListSnapshotStorageProvider);
+    final pubkey = _channelSnapshotPubkey(community);
+    if (snapshots == null || pubkey == null) return;
+    try {
+      // Retire writers before the revocation journal or credential changes.
+      // A disposable cache must never prevent local sign-out.
+      await snapshots.remove(pubkey, community.relayUrl);
+    } catch (error, stackTrace) {
+      developer.log(
+        'Channel snapshot deletion failed; orphan cleanup will retry',
+        name: 'buzz.community',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
+  }
+
+  Future<void> _removeOrphanChannelListSnapshots(
+    List<Community> communities,
+  ) async {
+    final snapshots = ref.read(channelListSnapshotStorageProvider);
     if (snapshots == null) return;
-    final pubkey = community.pubkey ?? _pubkeyFromNsec(community.nsec);
-    if (pubkey == null) return;
-    await snapshots.remove(pubkey, community.relayUrl);
+    await snapshots.removeOrphans({
+      for (final community in communities)
+        if (_channelSnapshotPubkey(community) case final pubkey?)
+          ChannelListSnapshotStorage.key(pubkey, community.relayUrl),
+    });
   }
 
   Future<void> switchCommunity(String id) {
@@ -643,12 +671,3 @@ final activeCommunityProvider = FutureProvider<Community?>((ref) async {
     orElse: () => communities.first,
   );
 });
-
-String? _pubkeyFromNsec(String? nsec) {
-  if (nsec == null || nsec.isEmpty) return null;
-  try {
-    return nostr.Keys(nostr.Nip19.decode(payload: nsec).data).public;
-  } catch (_) {
-    return null;
-  }
-}

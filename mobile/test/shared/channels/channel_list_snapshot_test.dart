@@ -2,6 +2,7 @@ import 'package:buzz/features/channels/channel.dart';
 import 'package:buzz/shared/channels/channel_list_snapshot.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:shared_preferences_platform_interface/shared_preferences_platform_interface.dart';
 
 const _pubkey = 'ABCDEF';
 const _relay = 'https://relay.example';
@@ -37,9 +38,12 @@ ChannelListSnapshot _snapshot([List<Channel>? channels]) => ChannelListSnapshot(
 void main() {
   late SharedPreferences prefs;
   late ChannelListSnapshotStorage storage;
+  late _SnapshotStore store;
 
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
+    store = _SnapshotStore();
+    SharedPreferencesStorePlatform.instance = store;
     prefs = await SharedPreferences.getInstance();
     storage = ChannelListSnapshotStorage(prefs);
   });
@@ -59,10 +63,52 @@ void main() {
   test('scopes by identity and relay, folding websocket origins', () async {
     await storage.write(storage.capture(_pubkey, _relay), _snapshot());
 
-    expect(storage.read('abcdef', 'wss://RELAY.example/'), isNotNull);
+    for (final relay in [
+      'wss://RELAY.example/',
+      'wss://relay.example:443',
+      ' https://RELAY.example/ ',
+    ]) {
+      expect(storage.read('abcdef', relay), isNotNull);
+    }
+    expect(storage.read(_pubkey, 'wss://relay.example:8443'), isNull);
+    expect(
+      ChannelListSnapshotStorage.key(_pubkey, 'ws://relay.example:80'),
+      ChannelListSnapshotStorage.key(_pubkey, 'http://relay.example'),
+    );
     expect(storage.read('other', _relay), isNull);
     expect(storage.read(_pubkey, 'https://other.example'), isNull);
   });
+
+  test(
+    'unchanged snapshots skip disk writes, failed writes remain retryable',
+    () async {
+      final token = storage.capture(_pubkey, _relay);
+      expect(await storage.write(token, _snapshot()), isTrue);
+      expect(
+        await ChannelListSnapshotStorage(prefs).write(token, _snapshot()),
+        isTrue,
+      );
+      expect(store.writes, 1);
+      final changed = ChannelListSnapshot(channels: [], hiddenDmIds: {});
+      for (final failure in ['false', 'throw']) {
+        store.failure = failure;
+        final result = storage.write(token, changed);
+        if (failure == 'throw') {
+          await expectLater(result, throwsStateError);
+        } else {
+          expect(await result, isFalse);
+        }
+        store.failure = null;
+        final beforeRetry = store.writes;
+        expect(
+          await ChannelListSnapshotStorage(prefs).write(token, changed),
+          isTrue,
+        );
+        expect(store.writes, beforeRetry + 1);
+        expect(await storage.write(token, _snapshot()), isTrue);
+      }
+    },
+  );
 
   test('removal retires tokens captured before it, on any instance', () async {
     final stale = storage.capture(_pubkey, _relay);
@@ -106,4 +152,17 @@ void main() {
     );
     expect(storage.read(_pubkey, _relay), isNull);
   });
+}
+
+class _SnapshotStore extends InMemorySharedPreferencesStore {
+  _SnapshotStore() : super.empty();
+  int writes = 0;
+  String? failure;
+  @override
+  Future<bool> setValue(String type, String key, Object value) async {
+    writes++;
+    if (failure == 'false') return false;
+    if (failure == 'throw') throw StateError('disk failure');
+    return super.setValue(type, key, value);
+  }
 }

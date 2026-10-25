@@ -5,6 +5,7 @@ import 'package:buzz/features/channels/channels_provider.dart';
 import 'package:buzz/shared/channels/channel_list_snapshot.dart';
 import 'package:buzz/shared/relay/relay.dart';
 import 'package:buzz/shared/theme/theme_provider.dart';
+import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -70,38 +71,84 @@ void main() {
       await _settle();
       container.dispose();
 
-      final offline = _SnapshotSession([], connected: false);
-      container = _container(prefs, offline);
-      final subscription = container.listen(channelsProvider, (_, _) {});
-      expect((await container.read(channelsProvider.future)).map((c) => c.id), [
-        'alpha',
-        'bravo',
-      ]);
-      expect(
-        container.read(channelsProvider.notifier).hasCachedSnapshot,
-        isTrue,
-      );
-      expect(container.read(channelsProvider.notifier).hiddenDmIds, {
-        'hidden-dm',
-      });
-      expect(container.read(channelsProvider.notifier).hasLoaded, isTrue);
-      expect(offline.membershipRequests, 0);
+      fakeAsync((clock) {
+        final offline = _SnapshotSession([], connected: false);
+        container = _container(prefs, offline);
+        container.listen(channelsProvider, (_, _) {});
+        clock.flushMicrotasks();
+        expect(container.read(channelsProvider).requireValue.map((c) => c.id), [
+          'alpha',
+          'bravo',
+        ]);
+        expect(
+          container.read(channelsProvider.notifier).hasCachedSnapshot,
+          isTrue,
+        );
+        expect(container.read(channelsProvider.notifier).hiddenDmIds, {
+          'hidden-dm',
+        });
+        expect(offline.membershipRequests, 0);
 
-      offline.fail = true;
-      offline.connect();
-      await _settle();
-      expect(container.read(channelsProvider).hasError, isFalse);
-      expect(container.read(channelsProvider).requireValue.map((c) => c.id), [
-        'alpha',
-        'bravo',
-      ]);
-      offline.fail = false;
-      offline.ids = ['bravo'];
-      await container.read(channelsProvider.notifier).refresh();
-      await _settle();
-      expect(container.read(channelsProvider).requireValue.single.id, 'bravo');
-      subscription.close();
-      container.dispose();
+        offline.fail = true;
+        offline.connect();
+        clock.flushMicrotasks();
+        clock.elapse(const Duration(minutes: 2));
+        clock.flushMicrotasks();
+        expect(
+          offline.membershipRequests,
+          3,
+        ); // One bounded attempt per minute.
+        expect(offline.listeners, isEmpty);
+        // A slow attempt cannot accumulate overlapping periodic retries.
+        final gate = Completer<void>();
+        offline.gate = gate;
+        clock.elapse(const Duration(minutes: 1));
+        clock.flushMicrotasks();
+        final parkedRequests = offline.membershipRequests;
+        clock.elapse(const Duration(minutes: 2));
+        clock.flushMicrotasks();
+        expect(offline.membershipRequests, parkedRequests);
+        gate.complete();
+        clock.flushMicrotasks();
+        offline.gate = null;
+        expect(container.read(channelsProvider).hasError, isFalse);
+        expect(container.read(channelsProvider).requireValue, hasLength(2));
+
+        offline.fail = false;
+        offline.ids = ['bravo'];
+        clock.elapse(const Duration(minutes: 1));
+        clock.flushMicrotasks();
+        expect(
+          container.read(channelsProvider).requireValue.single.id,
+          'bravo',
+        );
+        expect(offline.listeners, isNotEmpty);
+        final latestReads = offline.latestReads;
+        expect(latestReads, greaterThan(0));
+        // Live updates work after recovery, and ordinary reconnects stay light.
+        final live = offline.event(9, [
+          ['h', 'bravo'],
+          ['p', 'me'],
+        ]);
+        for (final listener in offline.listeners.toList()) {
+          listener(live);
+        }
+        expect(
+          container.read(channelsProvider).requireValue.single.lastMessageAt,
+          DateTime.fromMillisecondsSinceEpoch(1000, isUtc: true),
+        );
+        offline.disconnect();
+        offline.connect();
+        clock.flushMicrotasks();
+        expect(offline.latestReads, latestReads);
+        expect(
+          container.read(channelsProvider).requireValue.single.lastMessageAt,
+          DateTime.fromMillisecondsSinceEpoch(1000, isUtc: true),
+        );
+        container.dispose();
+        clock.elapse(const Duration(minutes: 2));
+        expect(clock.pendingTimers, isEmpty);
+      });
 
       container = _container(prefs, _SnapshotSession([], connected: false));
       addTearDown(container.dispose);
@@ -256,6 +303,7 @@ class _SnapshotSession extends RelaySessionNotifier {
   bool fail = false;
   Completer<void>? gate;
   int membershipRequests = 0;
+  int latestReads = 0;
   final listeners = <void Function(NostrEvent)>[];
   @override
   SessionState build() => SessionState(
@@ -278,6 +326,7 @@ class _SnapshotSession extends RelaySessionNotifier {
     List<NostrFilter> filters, {
     Duration timeout = const Duration(seconds: 8),
   }) async {
+    if (filters.any((filter) => filter.limit == 20)) latestReads++;
     if (filters.singleOrNull?.kinds.contains(39002) == true) {
       if (filters.single.until != null) return [];
       membershipRequests++;

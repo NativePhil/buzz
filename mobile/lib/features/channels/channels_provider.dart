@@ -67,6 +67,8 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
   String? _threadInterestPubkey;
   bool _hasLoaded = false;
   bool _hasCachedSnapshot = false;
+  bool _needsSnapshotRevalidation = false;
+  bool _backgroundRefreshInFlight = false;
   int _buildGeneration = 0;
   void Function(List<Channel>, Set<String>)? _saveSnapshot;
   String? _memberSnapshotRelayBaseUrl;
@@ -141,6 +143,7 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
   @override
   Future<List<Channel>> build() async {
     final buildGeneration = ++_buildGeneration;
+    _backgroundRefreshInFlight = false;
     _refreshCoordinator.retireInFlight();
     final relayBaseUrl = ref.watch(relayConfigProvider).baseUrl;
     final pubkey = ref.watch(myPubkeyProvider)?.toLowerCase();
@@ -150,6 +153,7 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
       // Never reuse another community or identity’s in-memory content.
       _hasLoaded = false;
       _hasCachedSnapshot = false;
+      _needsSnapshotRevalidation = false;
       _memberSnapshotRelayBaseUrl = relayBaseUrl;
       _memberSnapshotPubkey = pubkey;
       _memberSnapshotsByChannelId = const {};
@@ -178,7 +182,7 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
         // A new authenticated connection can change relay admission policy.
         // Ordinary refreshes must not retry an unchanged terminal rejection.
         _terminallyClosedLiveChunks.clear();
-        unawaited(refresh());
+        unawaited(_refreshInBackground());
       }
     });
 
@@ -201,12 +205,13 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
     });
 
     if (snapshot != null) {
+      _startBackstopTimer();
       // Install local data before starting work that can notify listeners.
       unawaited(
         Future<void>.microtask(() async {
           if (waitingForInitialConnection) await connected.future;
           if (!ref.mounted || buildGeneration != _buildGeneration) return;
-          await refresh();
+          await _refreshInBackground();
         }),
       );
       return snapshot;
@@ -503,6 +508,7 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
         }
       }
     }
+    if (fetchLastMessage) _needsSnapshotRevalidation = false;
     saveSnapshot?.call(channels, _hiddenDmIds);
     return channels;
   }

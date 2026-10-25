@@ -1,8 +1,10 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../relay/relay_provider.dart' show RelayConfig;
 import '../theme/community_theme_preference.dart';
 import '../theme/theme_provider.dart';
 
@@ -47,15 +49,18 @@ class ChannelListSnapshotStorage {
 
   /// Retirement epochs shared by every storage over the same preferences.
   static final _epochsByPrefs = Expando<Map<String, int>>();
+  static final _savedValuesByPrefs = Expando<Map<String, String>>();
+
+  Map<String, String> get _savedValues => _savedValuesByPrefs[_prefs] ??= {};
 
   Map<String, int> get _epochs => _epochsByPrefs[_prefs] ??= {};
 
   /// The scope key. `wss://`/`ws://` origins fold to `https://`/`http://`
   /// like `RelayConfig.baseUrl`, so both onboarding paths share a snapshot.
   static String key(String pubkey, String relayUrl) {
-    final relay = normalizeCommunityRelayUrl(relayUrl)
-        .replaceFirst(RegExp('^wss://'), 'https://')
-        .replaceFirst(RegExp('^ws://'), 'http://');
+    final relay = RelayConfig(
+      baseUrl: normalizeCommunityRelayUrl(relayUrl),
+    ).baseUrl;
     return '$_keyPrefix:${pubkey.toLowerCase()}:${Uri.encodeComponent(relay)}';
   }
 
@@ -87,6 +92,7 @@ class ChannelListSnapshotStorage {
       );
     } catch (_) {
       // Unusable cache: drop it without retiring in-flight writers.
+      _savedValues.remove(key);
       _prefs.remove(key).ignore();
       return null;
     }
@@ -114,20 +120,52 @@ class ChannelListSnapshotStorage {
           });
     if (raw == null || utf8.encode(raw).length > maxChannelListSnapshotBytes) {
       // An older, smaller snapshot no longer describes this list.
+      _savedValues.remove(token._key);
       await _prefs.remove(token._key);
       return false;
     }
+    if (_savedValues[token._key] == raw &&
+        _prefs.getString(token._key) == raw) {
+      return true;
+    }
     // The token check and SharedPreferences' synchronous in-memory update run
     // without an intervening await, so a later remove always wins.
-    return _prefs.setString(token._key, raw);
+    // Failed platform writes still change SharedPreferences' memory cache.
+    // Only skip values known to have been successfully persisted.
+    _savedValues.remove(token._key);
+    final saved = await _prefs.setString(token._key, raw);
+    if (saved && (_epochs[token._key] ?? 0) == token._epoch) {
+      _savedValues[token._key] = raw;
+    }
+    return saved;
   }
 
   /// Deletes the scope's snapshot and retires its outstanding tokens.
   ///
-  /// Throws when storage cannot delete it, so removal never reports success
-  /// while the community's channel names remain on disk.
+  /// Throws on storage failure. Community sign-out treats this as best-effort;
+  /// orphan cleanup retries the remaining disk entry.
   Future<void> remove(String pubkey, String relayUrl) async {
-    final key = ChannelListSnapshotStorage.key(pubkey, relayUrl);
+    await _removeKey(ChannelListSnapshotStorage.key(pubkey, relayUrl));
+  }
+
+  /// Retires and deletes snapshots without a stored community. Failed deletes
+  /// remain on disk for retry at the next startup or community mutation.
+  Future<void> removeOrphans(Set<String> retainedKeys) async {
+    final keys = {..._prefs.getKeys(), ..._epochs.keys};
+    for (final key in keys) {
+      if (!key.startsWith('$_keyPrefix:') || retainedKeys.contains(key)) {
+        continue;
+      }
+      try {
+        await _removeKey(key);
+      } catch (error) {
+        debugPrint('[ChannelListSnapshotStorage] cleanup failed: $error');
+      }
+    }
+  }
+
+  Future<void> _removeKey(String key) async {
+    _savedValues.remove(key);
     _epochs[key] = (_epochs[key] ?? 0) + 1;
     if (!await _prefs.remove(key)) {
       throw StateError('Channel list snapshot could not be removed.');

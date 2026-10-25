@@ -165,11 +165,35 @@ extension _ChannelsNotifierLiveSubscriptions on ChannelsNotifier {
     _notifyUnreadReadinessChanged();
     unawaited(_unreadCatchUp);
 
-    _backstopTimer?.cancel();
-    _backstopTimer = Timer.periodic(
+    _startBackstopTimer();
+  }
+
+  // Arm recovery before the first network load succeeds. A restored snapshot
+  // needs one full load; subsequent reconnects keep the metadata-only backstop.
+  void _startBackstopTimer() {
+    _backstopTimer ??= Timer.periodic(
       ChannelsNotifier._backstopInterval,
-      (_) => _backstopRefresh(),
+      (_) => unawaited(_refreshInBackground()),
     );
+  }
+
+  Future<void> _refreshInBackground() async {
+    if (_backgroundRefreshInFlight ||
+        _lifecycleRef.read(relaySessionProvider).status !=
+            SessionStatus.connected) {
+      return;
+    }
+    final generation = _buildGeneration;
+    _backgroundRefreshInFlight = true;
+    try {
+      if (_needsSnapshotRevalidation) {
+        await refresh();
+      } else {
+        await _backstopRefresh();
+      }
+    } finally {
+      if (generation == _buildGeneration) _backgroundRefreshInFlight = false;
+    }
   }
 
   void _handleLiveChunkClosed(String chunkKey, int generation, String message) {
