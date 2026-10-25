@@ -33,7 +33,7 @@ export function RecoveryScreen({
           }}
           type="button"
         >
-          Relaunch Buzz
+          Relaunch Omni
         </Button>
       </div>
     </div>

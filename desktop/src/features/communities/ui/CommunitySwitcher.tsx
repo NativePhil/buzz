@@ -190,7 +190,7 @@ export function CommunitySwitcher({
       if (result?.status === "already-absent") {
         toast("Community removed", {
           description:
-            "You were no longer a member, so Buzz removed the community from this device.",
+            "You were no longer a member, so Omni removed the community from this device.",
         });
       }
     } catch (error) {
@@ -516,7 +516,7 @@ export function CommunitySwitcher({
           <AlertDialogHeader>
             <AlertDialogTitle>Remove from this device</AlertDialogTitle>
             <AlertDialogDescription>
-              {`Remove "${removingCommunity?.name ?? ""}" from this device? Buzz won't contact the relay, so your membership isn't revoked. You can add the community again later.`}
+              {`Remove "${removingCommunity?.name ?? ""}" from this device? Omni won't contact the relay, so your membership isn't revoked. You can add the community again later.`}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

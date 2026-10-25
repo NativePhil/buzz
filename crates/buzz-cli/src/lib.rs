@@ -12,7 +12,7 @@ use error::CliError;
 use nostr::Keys;
 use uuid::Uuid;
 
-/// Run the Buzz CLI from raw arguments (including `argv[0]`).
+/// Run the Omni CLI from raw arguments (including `argv[0]`).
 ///
 /// Returns a process exit code (0 = success).
 ///
@@ -119,9 +119,9 @@ fn env_output_format(value: Option<&std::ffi::OsStr>) -> OutputFormat {
 #[derive(Parser)]
 #[command(
     name = "buzz",
-    about = "Buzz CLI — interact with a Buzz relay",
+    about = "Omni CLI — interact with an Omni relay",
     long_about = "\
-Buzz CLI — interact with a Buzz relay
+Omni CLI — interact with an Omni relay
 
 Configuration (flags override env vars):
   BUZZ_RELAY_URL     Relay base URL        [default: http://localhost:3000]

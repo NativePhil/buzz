@@ -9,11 +9,11 @@ import { getMentionOffsets } from "./hasMention";
 /**
  * Dual-flavor clipboard support for mentions.
  *
- * Every Buzz copy writes two flavors:
+ * Every Omni copy writes two flavors:
  *  - `text/plain` — what a human should read anywhere: sigils restored, no
  *    pubkeys. This is what external apps (TextEdit, Slack, …) receive.
  *  - `text/html` — the same content, with each mention wrapped in a span
- *    carrying its pubkey. Pasting back into a Buzz composer harvests those
+ *    carrying its pubkey. Pasting back into a Omni composer harvests those
  *    records, registers `name → pubkey` with the mention machinery, and the
  *    chip re-lights with the exact tagged identity.
  *
@@ -21,7 +21,7 @@ import { getMentionOffsets } from "./hasMention";
  * which content path to use — see `BuzzCopyKind`.
  */
 
-/** Marks clipboard HTML that Buzz produced, and what its plain flavor holds. */
+/** Marks clipboard HTML that Omni produced, and what its plain flavor holds. */
 export const BUZZ_COPY_ATTRIBUTE = "data-buzz-copy";
 /** 64-hex pubkey of the mentioned identity. */
 export const MENTION_PUBKEY_ATTRIBUTE = "data-mention-pubkey";
@@ -59,7 +59,7 @@ export type ChipTextMatch = "full" | "truncated" | "fragment";
  * keep one — so they cannot drift apart on what counts as a whole chip.
  *
  * - `full` — the text carries the whole label, allowing for what a legitimate
- *   chip picks up in transit: Buzz's copy handlers write the sigil into the
+ *   chip picks up in transit: Omni's copy handlers write the sigil into the
  *   text, `buildMentionSpanHtml` keeps the author's casing over the label's,
  *   and a pasteboard round trip can swap spaces for U+00A0.
  * - `truncated` — the text is the ellipsized form `truncateInlineChipLabel`
@@ -114,7 +114,7 @@ export function matchChipTextToLabel(
 }
 
 /**
- * What the `text/plain` flavor of a Buzz copy contains.
+ * What the `text/plain` flavor of a Omni copy contains.
  *
  * - `markdown` — Markdown source (copy-message, composer copy/cut). Paste
  *   inserts the plain flavor so TipTap's Markdown parsing behaves exactly as
@@ -283,7 +283,7 @@ export function buildMentionClipboardHtml({
   return `<span ${BUZZ_COPY_ATTRIBUTE}="${kind}">${parts.join("")}</span>`;
 }
 
-/** The Buzz copy marker on clipboard HTML, or `null` for foreign HTML. */
+/** The Omni copy marker on clipboard HTML, or `null` for foreign HTML. */
 export function getBuzzCopyKind(html: string): BuzzCopyKind | null {
   const match = html.match(
     new RegExp(
@@ -303,7 +303,7 @@ function readAttribute(tag: string, name: string): string | null {
 }
 
 /**
- * Recover the `label → pubkey` records a Buzz copy embedded in its HTML.
+ * Recover the `label → pubkey` records a Omni copy embedded in its HTML.
  *
  * Reads the label from `data-mention-label` rather than the element's text so
  * the result never depends on how a pasteboard round-trip reformatted the
@@ -369,7 +369,7 @@ export function selectVisibleMentionIdentities(
 }
 
 /**
- * Narrow copied records to the pairs trusted Buzz state vouches for.
+ * Narrow copied records to the pairs trusted Omni state vouches for.
  *
  * Must resolve to a subset of what it was handed; callers enforce that rather
  * than assume it, so the seam cannot widen into "the verifier decides what
@@ -408,7 +408,7 @@ export async function selectVouchedMentionIdentities(
  *
  * Three conditions, all necessary. The clipboard has to *carry* the record;
  * the content the paste inserts has to *show* its label, so no binding
- * outlives a paste the user could not see; and trusted Buzz state has to
+ * outlives a paste the user could not see; and trusted Omni state has to
  * *vouch* for the pair, because a visible `@John Smith` beside an attacker's
  * key is visible either way.
  *

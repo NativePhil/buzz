@@ -1,3 +1,14 @@
+## Unreleased — native/mneme-integration
+
+### Branding
+
+- User-facing surfaces rebranded from "Buzz" to "Omni": desktop product name,
+  bundle identifier (`app.native.omni`), window title, application icons and
+  mark, web client title, mobile app labels, CLI help header, and UI copy.
+- Protocol-level identifiers intentionally unchanged: `buzz://` deep links,
+  `buzz-*` binary names, `BUZZ_*` environment variables, relay HTTP/WS routes.
+- See NOTICE.md for attribution.
+
 # Changelog
 
 ## v0.5.28

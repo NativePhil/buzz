@@ -150,7 +150,7 @@ export function parseSnapshotClipboardHtml(html: string): ImetaMedia | null {
 
 export const parseAgentSnapshotClipboardHtml = parseSnapshotClipboardHtml;
 
-/** Convert a Buzz snapshot clipboard payload into one pending attachment. */
+/** Convert a Omni snapshot clipboard payload into one pending attachment. */
 export function handleSnapshotPaste(
   event: Pick<ClipboardEvent, "clipboardData" | "preventDefault">,
   setPendingImeta: (

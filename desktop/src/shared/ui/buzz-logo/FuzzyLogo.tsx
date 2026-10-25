@@ -18,14 +18,14 @@ export type FuzzyLogoProps = {
 };
 
 /**
- * The fuzzy Buzz mark. v8 ships a built-in animated texture (looping fractal-noise
+ * The fuzzy Omni mark. v8 ships a built-in animated texture (looping fractal-noise
  * turbulence + grain) applied via an SVG filter. Set `fuzz={false}` to render the
  * crisp geometry with a lightweight CSS pulse — recommended for long-lived mounts.
  */
 export function FuzzyLogo({
   fuzz = true,
   className,
-  ariaLabel = "Buzz logo",
+  ariaLabel = "Omni logo",
   loop = false,
   loopRestSeconds = 0,
   pulse = true,
