@@ -7,6 +7,7 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:nostr/nostr.dart' as nostr;
 
 import '../auth/auth_provider.dart';
+import '../channels/channel_list_snapshot.dart';
 import '../hosted/community_entry_requirements.dart';
 import '../push/dev_push_lease.dart';
 import '../push/push_bridge.dart';
@@ -320,6 +321,10 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
         revocationJournaled = await ref.read(
           communityPushLeaseRevocationEnqueuerProvider,
         )(current[removedIndex]);
+        // Delete cached channel names before credentials, so a failure here
+        // leaves the community removable rather than orphaning the cache.
+        // Removal also retires every write token captured before it.
+        await _removeChannelListSnapshot(current[removedIndex]);
       }
       await storage.remove(id);
 
@@ -353,6 +358,14 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
         );
       }
     });
+  }
+
+  Future<void> _removeChannelListSnapshot(Community community) async {
+    final snapshots = ref.read(channelListSnapshotStorageProvider);
+    if (snapshots == null) return;
+    final pubkey = community.pubkey ?? _pubkeyFromNsec(community.nsec);
+    if (pubkey == null) return;
+    await snapshots.remove(pubkey, community.relayUrl);
   }
 
   Future<void> switchCommunity(String id) {
@@ -630,3 +643,12 @@ final activeCommunityProvider = FutureProvider<Community?>((ref) async {
     orElse: () => communities.first,
   );
 });
+
+String? _pubkeyFromNsec(String? nsec) {
+  if (nsec == null || nsec.isEmpty) return null;
+  try {
+    return nostr.Keys(nostr.Nip19.decode(payload: nsec).data).public;
+  } catch (_) {
+    return null;
+  }
+}

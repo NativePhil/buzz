@@ -3,6 +3,10 @@ import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:hooks_riverpod/misc.dart';
+import 'package:buzz/shared/channels/channel_list_snapshot.dart';
+import 'package:buzz/shared/theme/theme_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:buzz/shared/community/community.dart';
 import 'package:buzz/shared/community/community_provider.dart';
 import 'package:buzz/shared/community/community_storage.dart';
@@ -42,7 +46,7 @@ void main() {
 
   tearDown(() => container.dispose());
 
-  ProviderContainer createContainer() {
+  ProviderContainer createContainer({List<Override> overrides = const []}) {
     Future<void> writeSnapshot(List<Community> communities) async {
       snapshots.add(List.of(communities));
     }
@@ -61,6 +65,7 @@ void main() {
         communityPushLeaseRevocationTriggerProvider.overrideWithValue(
           revocationTrigger,
         ),
+        ...overrides,
       ],
     );
   }
@@ -427,6 +432,48 @@ void main() {
       expect(deactivatedCommunityIds, isEmpty);
       expect(revocationTriggers, 1);
     });
+
+    test(
+      'removal deletes the channel list snapshot and retires writers',
+      () async {
+        SharedPreferences.setMockInitialValues({});
+        final prefs = await SharedPreferences.getInstance();
+        final keys = nostr.Keys.generate();
+        final community = Community.create(
+          name: 'Cached',
+          relayUrl: 'wss://cached.example.com',
+          nsec: keys.nsec,
+        );
+        final otherScope = Community.create(
+          name: 'Other',
+          relayUrl: 'https://other.example.com',
+          nsec: keys.nsec,
+        );
+        final snapshots = ChannelListSnapshotStorage(prefs);
+        const snapshot = ChannelListSnapshot(channels: [], hiddenDmIds: {});
+        // A refresh captured its token before removal and writes after it.
+        final inFlight = snapshots.capture(keys.public, community.relayUrl);
+        await snapshots.write(inFlight, snapshot);
+        await snapshots.write(
+          snapshots.capture(keys.public, otherScope.relayUrl),
+          snapshot,
+        );
+        container = createContainer(
+          overrides: [savedPrefsProvider.overrideWithValue(prefs)],
+        );
+        final notifier = container.read(communityListProvider.notifier);
+        await container.read(communityListProvider.future);
+        await notifier.addCommunity(community);
+        await notifier.addCommunity(otherScope);
+
+        await notifier.removeCommunity(community.id);
+
+        expect(snapshots.read(keys.public, community.relayUrl), isNull);
+        expect(await snapshots.write(inFlight, snapshot), isFalse);
+        expect(snapshots.read(keys.public, community.relayUrl), isNull);
+        expect(snapshots.read(keys.public, otherScope.relayUrl), isNotNull);
+      },
+    );
 
     test('remote tombstone attempt cannot block local removal', () async {
       final remoteAttempt = Completer<void>();

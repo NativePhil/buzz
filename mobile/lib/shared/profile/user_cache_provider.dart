@@ -53,6 +53,34 @@ class UserCacheNotifier extends Notifier<Map<String, UserProfile>> {
     state = {...state, profile.pubkey.toLowerCase(): profile};
   }
 
+  /// Resolves missing profiles through verified batch admission.
+  ///
+  /// Unlike [preload], failures propagate to callers whose result requires
+  /// profile hydration. Cached profiles remain reusable within this scope.
+  Future<Map<String, UserProfile>> resolve(List<String> pubkeys) async {
+    final requested = pubkeys.map((pubkey) => pubkey.toLowerCase()).toSet();
+    final missing = requested
+        .where((pubkey) => !state.containsKey(pubkey))
+        .toList();
+    final generation = _generation;
+    final session = ref.read(relaySessionProvider.notifier);
+    for (final batch in _profileQueryBatches(missing)) {
+      if (!_isCurrent(generation)) {
+        throw StateError('Profile request belongs to a retired cache');
+      }
+      final events = await session.fetchHistory(
+        NostrFilters.profilesBatch(batch),
+      );
+      if (!await _verifyAndMerge(events, generation)) {
+        throw StateError('Profile request belongs to a retired cache');
+      }
+    }
+    if (!_isCurrent(generation)) {
+      throw StateError('Profile request belongs to a retired cache');
+    }
+    return {for (final pubkey in requested) pubkey: ?state[pubkey]};
+  }
+
   /// Preload profiles for a list of pubkeys (e.g. channel members).
   /// Returns whether the batch completed successfully.
   Future<bool> preload(List<String> pubkeys) {
