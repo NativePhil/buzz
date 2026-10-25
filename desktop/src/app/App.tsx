@@ -602,7 +602,7 @@ function CommunityApp({
       // Show welcome setup for first-run users with no communities
       appContent = (
         <WelcomeSetup
-          initialPage={resumeFirstCommunityPage ?? undefined}
+          initialPage={resumeFirstCommunityPage === "owned" ? "create" : resumeFirstCommunityPage ?? undefined}
           onBack={
             isFindingCommunityAfterLeave ? undefined : onBackToMachineConfig
           }

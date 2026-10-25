@@ -1,7 +1,6 @@
 import * as React from "react";
 import { Check, Copy } from "lucide-react";
 
-import { HostedCommunityOnboarding } from "@/features/communities/ui/HostedCommunityOnboarding";
 import { useCommunityOnboarding } from "@/features/onboarding/communityOnboarding";
 import { InviteRedeemForm } from "@/features/onboarding/ui/InviteRedeemForm";
 import { OnboardingChrome } from "@/features/onboarding/ui/OnboardingChrome";
@@ -18,7 +17,7 @@ import { Button } from "@/shared/ui/button";
 import { Card } from "@/shared/ui/card";
 import { StartupWindowDragRegion } from "@/shared/ui/StartupWindowDragRegion";
 
-type WelcomeSetupPage = "welcome" | "existing" | "join" | "member" | "owned";
+type WelcomeSetupPage = "welcome" | "existing" | "join" | "member" | "create";
 type WelcomeTransitionMode = "initial" | OnboardingTransitionDirection;
 
 type WelcomeSetupProps = {
@@ -41,7 +40,7 @@ export function WelcomeSetup({
   // While true, the Builderlab sign-in modal floats over the current page —
   // we only navigate to the hosted stage once sign-in completes, so the page
   // behind the modal never changes out from under the user.
-  const [isHostedSignInOpen, setIsHostedSignInOpen] = React.useState(false);
+  const [createRelayUrl, setCreateRelayUrl] = React.useState("");
   const [copiedNpub, setCopiedNpub] = React.useState(false);
   const communityOnboarding = useCommunityOnboarding();
   const identityQuery = useIdentityQuery();
@@ -89,10 +88,14 @@ export function WelcomeSetup({
     [communityOnboarding, page],
   );
 
-  const beginHostedCommunity = React.useCallback(
-    () => setIsHostedSignInOpen(true),
-    [],
-  );
+  const startOwnCommunity = React.useCallback(() => {
+    if (!createRelayUrl.trim()) return;
+    communityOnboarding.start({
+      source: "first-community",
+      firstCommunityPage: "owned",
+      relayUrl: createRelayUrl.trim(),
+    });
+  }, [communityOnboarding, createRelayUrl]);
 
   const transitionDirection =
     transitionMode === "backward" ? "backward" : "forward";
@@ -163,7 +166,7 @@ export function WelcomeSetup({
                 >
                   <button
                     data-testid="community-choice-create"
-                    onClick={beginHostedCommunity}
+                    onClick={() => showPage("create")}
                     type="button"
                   >
                     Create a community
@@ -207,7 +210,7 @@ export function WelcomeSetup({
                 >
                   <button
                     data-testid="existing-choice-owner"
-                    onClick={beginHostedCommunity}
+                    onClick={() => showPage("create")}
                     type="button"
                   >
                     I own the community
@@ -228,13 +231,45 @@ export function WelcomeSetup({
                 </Card>
               </div>
             </OnboardingSlideTransition>
-          ) : page === "owned" ? (
+          ) : page === "create" ? (
             <OnboardingSlideTransition
               className="flex w-full flex-col items-center text-center"
               direction={transitionDirection}
-              transitionKey={`owned-${transitionDirection}`}
+              transitionKey={`create-${transitionDirection}`}
             >
-              <HostedCommunityOnboarding onBack={() => showPage("welcome")} />
+              <div className="w-full max-w-[620px]">
+                <h1 className="text-title font-normal">
+                  Create your community
+                </h1>
+                <p className="mt-3 text-sm leading-6 text-foreground/80">
+                  Enter your server's relay URL — the app connects, sets up your
+                  starter channels, and makes you the owner.
+                </p>
+              </div>
+              <div className="flex w-full max-w-[560px] flex-1 flex-col items-center justify-center gap-6">
+                <input
+                  className="h-11 w-full rounded-xl border border-foreground/15 bg-background px-4 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-foreground/35"
+                  data-testid="create-relay-url-input"
+                  onChange={(event) => {
+                    setCreateRelayUrl(event.target.value);
+                  }}
+                  placeholder="ws://your-server:3000 or your.host.com"
+                  type="text"
+                  value={createRelayUrl}
+                />
+                <Button
+                  className="h-11 w-full max-w-[320px] rounded-full"
+                  data-testid="create-relay-url-submit"
+                  disabled={!createRelayUrl.trim()}
+                  onClick={startOwnCommunity}
+                  type="button"
+                >
+                  Connect and set up
+                </Button>
+                <p className="text-xs leading-5 text-foreground/60">
+                  Self-hosted: your community lives on the relay you run.
+                </p>
+              </div>
             </OnboardingSlideTransition>
           ) : (
             <OnboardingSlideTransition
@@ -315,16 +350,6 @@ export function WelcomeSetup({
               </div>
             </OnboardingSlideTransition>
           )}
-          {isHostedSignInOpen && page !== "owned" ? (
-            <HostedCommunityOnboarding
-              onBack={() => setIsHostedSignInOpen(false)}
-              onReady={() => {
-                setIsHostedSignInOpen(false);
-                showPage("owned");
-              }}
-              stageHidden
-            />
-          ) : null}
         </div>
       </OnboardingFooterProvider>
     </div>

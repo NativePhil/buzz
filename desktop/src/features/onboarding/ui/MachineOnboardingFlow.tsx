@@ -343,7 +343,7 @@ export function MachineOnboardingFlow({
               <img
                 alt="Omni"
                 className="w-full max-w-[600px]"
-                src="/landing/buzz-wordmark.png"
+                src="/landing/omni-wordmark.png"
               />
               <p className="mt-2 max-w-[560px] text-center text-2xl font-normal leading-none text-foreground">
                 Your people, your agents, your projects —<br />
