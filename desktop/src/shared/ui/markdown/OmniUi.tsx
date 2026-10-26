@@ -1,5 +1,11 @@
 import * as React from "react";
-import { AlertTriangle, Check, ExternalLink, Info, Sparkles } from "lucide-react";
+import {
+  AlertTriangle,
+  Check,
+  ExternalLink,
+  Info,
+  Sparkles,
+} from "lucide-react";
 
 import {
   parseOmniUiBlock,
@@ -21,12 +27,12 @@ import {
   type TimelineProps,
 } from "./omniUiSchema";
 
-const CARD_CLASS =
+export const CARD_CLASS =
   "my-2 w-full max-w-[420px] rounded-2xl border border-foreground/10 bg-background/60 p-4 text-left shadow-sm";
 const PROVENANCE_CLASS =
   "mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 border-t border-foreground/10 pt-2 text-[11px] text-foreground/55";
 
-function ProvenanceFooter({ items }: { items?: ProvenanceRef[] }) {
+export function ProvenanceFooter({ items }: { items?: ProvenanceRef[] }) {
   if (!items?.length) return null;
   return (
     <div className={PROVENANCE_CLASS}>

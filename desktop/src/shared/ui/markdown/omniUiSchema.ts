@@ -51,7 +51,11 @@ export type RivePanelProps = {
   caption?: string;
 };
 
-export type StatusEntry = { name: string; status: "ok" | "degraded" | "down"; detail?: string };
+export type StatusEntry = {
+  name: string;
+  status: "ok" | "degraded" | "down";
+  detail?: string;
+};
 export type StatusGridProps = { title?: string; services: StatusEntry[] };
 
 export type ProgressProps = {
@@ -64,7 +68,11 @@ export type ProgressProps = {
 };
 
 export type ChecklistEntry = { text: string; done?: boolean };
-export type ChecklistProps = { title?: string; items: ChecklistEntry[]; summary?: string };
+export type ChecklistProps = {
+  title?: string;
+  items: ChecklistEntry[];
+  summary?: string;
+};
 
 export type TableProps = {
   title?: string;
@@ -75,7 +83,14 @@ export type TableProps = {
 export type TimelineEntry = { time?: string; title: string; detail?: string };
 export type TimelineProps = { title?: string; entries: TimelineEntry[] };
 
-export type KpiGridProps = { metrics: { label: string; value: string | number; unit?: string; delta?: number }[] };
+export type KpiGridProps = {
+  metrics: {
+    label: string;
+    value: string | number;
+    unit?: string;
+    delta?: number;
+  }[];
+};
 
 export type BarChartProps = {
   title?: string;
@@ -89,7 +104,11 @@ export type AlertBannerProps = {
   message: string;
 };
 
-export type PollProps = { question: string; options: { label: string; votes?: number }[]; total?: number };
+export type PollProps = {
+  question: string;
+  options: { label: string; votes?: number }[];
+  total?: number;
+};
 
 export type ItemCardProps = {
   title: string;
@@ -161,20 +180,31 @@ function isStr(v: unknown, max = MAX_STR): v is string {
   return typeof v === "string" && v.length > 0 && v.length <= max;
 }
 
-function optStr<T extends Record<string, unknown>>(obj: T, key: string, max = MAX_STR): void {
+function optStr<T extends Record<string, unknown>>(
+  obj: T,
+  key: string,
+  max = MAX_STR,
+): void {
   const v = obj[key];
   if (v !== undefined && !isStr(v, max)) delete obj[key];
 }
 
 function isStrArray(v: unknown, max = MAX_ITEMS): v is string[] {
-  return Array.isArray(v) && v.length > 0 && v.length <= max && v.every((x) => isStr(x, 120));
+  return (
+    Array.isArray(v) &&
+    v.length > 0 &&
+    v.length <= max &&
+    v.every((x) => isStr(x, 120))
+  );
 }
 
 function isNum(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v);
 }
 
-function sanitizeLinks(input: unknown): { label: string; url: string }[] | undefined {
+function sanitizeLinks(
+  input: unknown,
+): { label: string; url: string }[] | undefined {
   if (!Array.isArray(input)) return undefined;
   const out: { label: string; url: string }[] = [];
   for (const item of input.slice(0, 4)) {
@@ -230,29 +260,55 @@ function contactProps(p: Record<string, unknown>): ContactCardProps | null {
 }
 
 function metricProps(p: Record<string, unknown>): MetricCardProps | null {
-  if (!isStr(p.label) || !("value" in p) || !(typeof p.value === "string" || isNum(p.value))) return null;
+  if (
+    !isStr(p.label) ||
+    !("value" in p) ||
+    !(typeof p.value === "string" || isNum(p.value))
+  )
+    return null;
   const out: Record<string, unknown> = { label: p.label, value: p.value };
   if (isStr(p.unit, 40)) out.unit = p.unit;
   if (isStr(p.source, 120)) out.source = p.source;
-  if (p.delta && typeof p.delta === "object" && isNum((p.delta as { value?: unknown }).value)) {
+  if (
+    p.delta &&
+    typeof p.delta === "object" &&
+    isNum((p.delta as { value?: unknown }).value)
+  ) {
     const d = p.delta as { value: number; label?: unknown };
-    out.delta = { value: d.value, label: isStr(d.label, 60) ? d.label : undefined };
+    out.delta = {
+      value: d.value,
+      label: isStr(d.label, 60) ? d.label : undefined,
+    };
   }
-  if (Array.isArray(p.sparkline) && p.sparkline.length > 1 && p.sparkline.length <= 60 &&
-    p.sparkline.every(isNum)) {
+  if (
+    Array.isArray(p.sparkline) &&
+    p.sparkline.length > 1 &&
+    p.sparkline.length <= 60 &&
+    p.sparkline.every(isNum)
+  ) {
     out.sparkline = p.sparkline;
   }
   return out as unknown as MetricCardProps;
 }
 
 function actionsProps(p: Record<string, unknown>): ActionsRowProps | null {
-  if (!Array.isArray(p.actions) || p.actions.length === 0 || p.actions.length > 6) return null;
+  if (
+    !Array.isArray(p.actions) ||
+    p.actions.length === 0 ||
+    p.actions.length > 6
+  )
+    return null;
   const actions: ActionItem[] = [];
   for (const raw of p.actions) {
     if (!raw || typeof raw !== "object") return null;
     const a = raw as Record<string, unknown>;
     if (!isStr(a.label, 80)) return null;
-    const kind = a.kind === "link" ? "link" : a.kind === "agent_prompt" ? "agent_prompt" : undefined;
+    const kind =
+      a.kind === "link"
+        ? "link"
+        : a.kind === "agent_prompt"
+          ? "agent_prompt"
+          : undefined;
     const item: Record<string, unknown> = { label: a.label };
     if (kind) item.kind = kind;
     if (isStr(a.prompt, 600)) item.prompt = a.prompt;
@@ -268,10 +324,19 @@ function riveProps(p: Record<string, unknown>): RivePanelProps | null {
   const out: Record<string, unknown> = { asset: p.asset };
   if (isStr(p.stateMachine, 120)) out.stateMachine = p.stateMachine;
   if (p.caption && isStr(p.caption, 300)) out.caption = p.caption;
-  if (p.bindings && typeof p.bindings === "object" && !Array.isArray(p.bindings)) {
+  if (
+    p.bindings &&
+    typeof p.bindings === "object" &&
+    !Array.isArray(p.bindings)
+  ) {
     const clean: Record<string, string | number | boolean> = {};
-    for (const [k, v] of Object.entries(p.bindings as Record<string, unknown>).slice(0, 16)) {
-      if (isStr(k, 60) && (isStr(v, 200) || isNum(v) || typeof v === "boolean")) {
+    for (const [k, v] of Object.entries(
+      p.bindings as Record<string, unknown>,
+    ).slice(0, 16)) {
+      if (
+        isStr(k, 60) &&
+        (isStr(v, 200) || isNum(v) || typeof v === "boolean")
+      ) {
         clean[k] = v as string | number | boolean;
       }
     }
@@ -281,12 +346,22 @@ function riveProps(p: Record<string, unknown>): RivePanelProps | null {
 }
 
 function statusGridProps(p: Record<string, unknown>): StatusGridProps | null {
-  if (!Array.isArray(p.services) || p.services.length === 0 || p.services.length > 12) return null;
+  if (
+    !Array.isArray(p.services) ||
+    p.services.length === 0 ||
+    p.services.length > 12
+  )
+    return null;
   const services: StatusEntry[] = [];
   for (const raw of p.services) {
     if (!raw || typeof raw !== "object") return null;
     const s = raw as Record<string, unknown>;
-    if (!isStr(s.name, 80) || !isStr(s.status) || !["ok", "degraded", "down"].includes(s.status)) return null;
+    if (
+      !isStr(s.name, 80) ||
+      !isStr(s.status) ||
+      !["ok", "degraded", "down"].includes(s.status)
+    )
+      return null;
     const entry: Record<string, unknown> = { name: s.name, status: s.status };
     if (isStr(s.detail, 160)) entry.detail = s.detail;
     services.push(entry as unknown as StatusEntry);
@@ -299,7 +374,8 @@ function statusGridProps(p: Record<string, unknown>): StatusGridProps | null {
 function progressProps(p: Record<string, unknown>): ProgressProps | null {
   if (!isStr(p.label)) return null;
   const hasPercent = isNum(p.percent) && p.percent >= 0 && p.percent <= 100;
-  const hasSteps = isNum(p.step) && isNum(p.totalSteps) && (p.totalSteps as number) > 0;
+  const hasSteps =
+    isNum(p.step) && isNum(p.totalSteps) && (p.totalSteps as number) > 0;
   if (!hasPercent && !hasSteps) return null;
   const out: Record<string, unknown> = { label: p.label };
   if (hasPercent) out.percent = p.percent;
@@ -313,7 +389,8 @@ function progressProps(p: Record<string, unknown>): ProgressProps | null {
 }
 
 function checklistProps(p: Record<string, unknown>): ChecklistProps | null {
-  if (!Array.isArray(p.items) || p.items.length === 0 || p.items.length > 12) return null;
+  if (!Array.isArray(p.items) || p.items.length === 0 || p.items.length > 12)
+    return null;
   const items: ChecklistEntry[] = [];
   for (const raw of p.items) {
     if (!raw || typeof raw !== "object") return null;
@@ -328,7 +405,12 @@ function checklistProps(p: Record<string, unknown>): ChecklistProps | null {
 }
 
 function tableProps(p: Record<string, unknown>): TableProps | null {
-  if (!Array.isArray(p.columns) || p.columns.length === 0 || p.columns.length > 6) return null;
+  if (
+    !Array.isArray(p.columns) ||
+    p.columns.length === 0 ||
+    p.columns.length > 6
+  )
+    return null;
   const columns: { key: string; label: string }[] = [];
   for (const raw of p.columns) {
     if (!raw || typeof raw !== "object") return null;
@@ -353,7 +435,12 @@ function tableProps(p: Record<string, unknown>): TableProps | null {
 }
 
 function timelineProps(p: Record<string, unknown>): TimelineProps | null {
-  if (!Array.isArray(p.entries) || p.entries.length === 0 || p.entries.length > 12) return null;
+  if (
+    !Array.isArray(p.entries) ||
+    p.entries.length === 0 ||
+    p.entries.length > 12
+  )
+    return null;
   const entries: TimelineEntry[] = [];
   for (const raw of p.entries) {
     if (!raw || typeof raw !== "object") return null;
@@ -370,22 +457,41 @@ function timelineProps(p: Record<string, unknown>): TimelineProps | null {
 }
 
 function kpiGridProps(p: Record<string, unknown>): KpiGridProps | null {
-  if (!Array.isArray(p.metrics) || p.metrics.length === 0 || p.metrics.length > 6) return null;
-  const metrics: { label: string; value: string | number; unit?: string; delta?: number }[] = [];
+  if (
+    !Array.isArray(p.metrics) ||
+    p.metrics.length === 0 ||
+    p.metrics.length > 6
+  )
+    return null;
+  const metrics: {
+    label: string;
+    value: string | number;
+    unit?: string;
+    delta?: number;
+  }[] = [];
   for (const raw of p.metrics) {
     if (!raw || typeof raw !== "object") return null;
     const m = raw as Record<string, unknown>;
-    if (!isStr(m.label) || !(typeof m.value === "string" || isNum(m.value))) return null;
+    if (!isStr(m.label) || !(typeof m.value === "string" || isNum(m.value)))
+      return null;
     const out: Record<string, unknown> = { label: m.label, value: m.value };
     if (isStr(m.unit, 40)) out.unit = m.unit;
     if (isNum(m.delta)) out.delta = m.delta;
-    metrics.push(out as { label: string; value: string | number; unit?: string; delta?: number });
+    metrics.push(
+      out as {
+        label: string;
+        value: string | number;
+        unit?: string;
+        delta?: number;
+      },
+    );
   }
   return { metrics };
 }
 
 function barChartProps(p: Record<string, unknown>): BarChartProps | null {
-  if (!Array.isArray(p.bars) || p.bars.length < 2 || p.bars.length > 12) return null;
+  if (!Array.isArray(p.bars) || p.bars.length < 2 || p.bars.length > 12)
+    return null;
   const bars: { label: string; value: number }[] = [];
   for (const raw of p.bars) {
     if (!raw || typeof raw !== "object") return null;
@@ -402,14 +508,21 @@ function barChartProps(p: Record<string, unknown>): BarChartProps | null {
 const ALERT_LEVELS = new Set(["info", "warn", "error", "success"]);
 
 function alertProps(p: Record<string, unknown>): AlertBannerProps | null {
-  if (!isStr(p.level) || !ALERT_LEVELS.has(p.level) || !isStr(p.message, 400)) return null;
+  if (!isStr(p.level) || !ALERT_LEVELS.has(p.level) || !isStr(p.message, 400))
+    return null;
   const out: Record<string, unknown> = { level: p.level, message: p.message };
   if (isStr(p.title, 120)) out.title = p.title;
   return out as unknown as AlertBannerProps;
 }
 
 function pollProps(p: Record<string, unknown>): PollProps | null {
-  if (!isStr(p.question) || !Array.isArray(p.options) || p.options.length < 2 || p.options.length > 8) return null;
+  if (
+    !isStr(p.question) ||
+    !Array.isArray(p.options) ||
+    p.options.length < 2 ||
+    p.options.length > 8
+  )
+    return null;
   const options: { label: string; votes?: number }[] = [];
   for (const raw of p.options) {
     if (!raw || typeof raw !== "object") return null;
@@ -449,7 +562,10 @@ function itemCardProps(p: Record<string, unknown>): ItemCardProps | null {
   return out as unknown as ItemCardProps;
 }
 
-const VALIDATORS: Record<OmniUiComponent, (p: Record<string, unknown>) => OmniUiProps | null> = {
+const VALIDATORS: Record<
+  OmniUiComponent,
+  (p: Record<string, unknown>) => OmniUiProps | null
+> = {
   "contact-card": contactProps,
   "metric-card": metricProps,
   "actions-row": actionsProps,
@@ -484,7 +600,11 @@ export function parseOmniUiBlock(code: string): OmniUiBlock | null {
   if (!validate) return null;
   const clean = validate(props as Record<string, unknown>);
   if (!clean) return null;
-  const block: OmniUiBlock = { v: OMNI_UI_VERSION, component: component as OmniUiComponent, props: clean };
+  const block: OmniUiBlock = {
+    v: OMNI_UI_VERSION,
+    component: component as OmniUiComponent,
+    props: clean,
+  };
   const provenance = sanitizeProvenance(obj.provenance);
   if (provenance) block.provenance = provenance;
   return block;

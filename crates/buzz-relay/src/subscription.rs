@@ -381,6 +381,20 @@ impl SubscriptionRegistry {
         community_id: CommunityId,
         event: &StoredEvent,
     ) -> Vec<(ConnId, SubId)> {
+        // Protocol-debug: the registry size for this community, so a zero-match
+        // fan-out can be distinguished "no subs registered" from "wrong scope".
+        let community_subs = self
+            .channel_kind_index
+            .iter()
+            .filter(|entry| entry.key().0 == community_id)
+            .map(|entry| entry.value().len())
+            .sum::<usize>();
+        tracing::debug!(
+            community = %community_id,
+            registry_subs_for_community = community_subs,
+            event_kind = event.event.kind.as_u16(),
+            "fan_out_scoped entry"
+        );
         let mut results = Vec::new();
         let mut seen = HashSet::new();
 

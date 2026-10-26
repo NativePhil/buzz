@@ -396,7 +396,7 @@ pub async fn handle_req(
         return;
     };
 
-    debug!(conn_id = %conn_id, sub_id = %sub_id, "Subscription registered");
+    debug!(conn_id = %conn_id, sub_id = %sub_id, community = %conn.tenant.community(), "Subscription registered");
 
     // Registration above is one uncancellable unit; the history read below is
     // read-only delivery and races gate cancellation, so expiry drops it and

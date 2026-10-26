@@ -6,6 +6,7 @@ mod build_identity;
 mod builderlab;
 mod channel_head_cache;
 mod commands;
+mod openui_host;
 mod deep_link;
 mod egress_guard;
 mod event_sync;
@@ -537,6 +538,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            openui_host::evaluate_openui,
             terminal_runtime::terminal_attach,
             terminal_runtime::terminal_detach,
             terminal_runtime::terminal_close,

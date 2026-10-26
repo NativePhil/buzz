@@ -1183,6 +1183,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "objc2-user-notifications",
+ "openui",
  "percent-encoding",
  "plist",
  "png 0.18.1",
@@ -7210,6 +7211,15 @@ dependencies = [
  "percent-encoding",
  "portable-atomic",
  "rand 0.9.4",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "openui"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff1df8b1ba24776357d96cccd6cc1092216dd3e25b8d230254d550d232c7d288"
+dependencies = [
  "thiserror 2.0.18",
 ]
 

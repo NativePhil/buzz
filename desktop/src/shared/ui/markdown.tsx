@@ -52,6 +52,8 @@ import {
   SyntaxHighlightedCode,
 } from "./markdown/CodeBlock";
 import { OmniUiBlockView } from "./markdown/OmniUi";
+import { parseOmniUiBlock } from "./markdown/omniUiSchema";
+import { OpenUiHost } from "./markdown/OpenUiHost";
 import { EntityLinkAnchor, useOpenEntityLink } from "./markdown/entityLinks";
 import { ExternalLinkAnchor } from "./markdown/ExternalLinkAnchor";
 import { FileCard } from "./markdown/FileCard";
@@ -1417,7 +1419,12 @@ export function createMarkdownComponents(
         const language = extractLanguage(className);
 
         if (language === "omni-ui") {
-          return <OmniUiBlockView code={code} />;
+          // The blend: legacy JSON catalog blocks parse client-side; anything
+          // else evaluates as OpenUI Lang in the Tauri backend (bounded).
+          if (parseOmniUiBlock(code)) {
+            return <OmniUiBlockView code={code} />;
+          }
+          return <OpenUiHost code={code} />;
         }
 
         if (language) {
