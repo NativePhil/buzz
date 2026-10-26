@@ -51,6 +51,7 @@ import {
   MarkdownCodeBlock,
   SyntaxHighlightedCode,
 } from "./markdown/CodeBlock";
+import { OmniUiBlockView } from "./markdown/OmniUi";
 import { EntityLinkAnchor, useOpenEntityLink } from "./markdown/entityLinks";
 import { ExternalLinkAnchor } from "./markdown/ExternalLinkAnchor";
 import { FileCard } from "./markdown/FileCard";
@@ -1414,6 +1415,10 @@ export function createMarkdownComponents(
 
       if (isFencedCodeBlock || rawCode.endsWith("\n") || code.includes("\n")) {
         const language = extractLanguage(className);
+
+        if (language === "omni-ui") {
+          return <OmniUiBlockView code={code} />;
+        }
 
         if (language) {
           return (

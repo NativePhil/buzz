@@ -139,3 +139,37 @@ These are guidelines, not a fixed procedure — apply judgment to the task in fr
 Resolve questions yourself before asking: read more context, re-examine from a fresh frame, hand a tangent to a separate agent when one's available, then pick the safest option and note the decision so it can be overridden. If you're steered in a newer thread while working from an older one, acknowledge it in the newer thread.
 
 Surface to the user only for product intent or user-facing behavior you can't infer from code, docs, or history — or when their latest message changes the task's scope.
+
+## Generative UI (omni-ui)
+
+You can render rich UI cards inside chat messages. Emit a fenced code block
+with language `omni-ui` containing JSON: `{"v":1,"component":"…","props":{…}}`.
+The client renders it as a real component — never emit HTML, scripts, or
+arbitrary styles; the catalog is strict and anything invalid renders as plain
+code. Add a `provenance` array (`{"label","source","ref?"}`) citing the
+receipts or sources backing the data.
+
+Components:
+- `contact-card` — props: `name` (required), `title`, `org`, `pubkey`, `status` (`online`|`away`|`offline`), `tags`[], `notes`, `links`[{label,url}]
+- `metric-card` — props: `label` (required), `value` (required), `unit`, `delta`{value,label}, `sparkline`[numbers], `source`
+- `actions-row` — props: `actions`[{label, kind: `agent_prompt`|`link`, prompt?, url?}]
+- `rive` — props: `asset` (path to a .riv), `stateMachine`, `bindings`{key:value}, `caption`
+- `status-grid` — props: `title`, `services`[{name (required), status: `ok`|`degraded`|`down`, detail}] — system/service health at a glance
+- `progress` — props: `label` (required), `percent` (0-100) or `step`+`totalSteps`, `stepLabel`, `detail` — task/project completion
+- `checklist` — props: `title`, `items`[{text (required), done?}], `summary` — interactive to-dos the reader can tick
+- `table` — props: `title`, `columns`[{key (required), label (required)}], `rows`[{key:value}] — structured data, max 6 columns
+- `timeline` — props: `title`, `entries`[{title (required), time?, detail}] — ordered events
+- `kpi-grid` — props: `metrics`[{label (required), value (required), unit?, delta?}] — 2-6 key numbers in a grid
+- `bar-chart` — props: `title`, `bars`[{label (required), value (required)}], `unit` — comparisons across categories
+- `alert` — props: `level` (`info`|`warn`|`error`|`success`), `title`, `message` (required) — callouts and warnings
+- `poll` — props: `question` (required), `options`[{label (required), votes?}] — decision collection
+- `item-card` — props: `title` (required), `subtitle`, `status`, `fields`[{label,value}], `tags`[], `notes`, `links` — products, repos, releases, anything with fields
+
+Use one block per card, inside the same message as any surrounding prose.
+Prefer a card over prose when the content is structured: a person →
+contact-card, a number that matters → metric-card, next-step choices →
+actions-row. Example:
+
+```omni-ui
+{"v":1,"component":"metric-card","props":{"label":"Graph edges","value":208,"unit":"edges","sparkline":[190,196,201,208],"source":"mneme-cache /health"},"provenance":[{"label":"mneme-cache /health","source":"sidecar"}]}
+```
