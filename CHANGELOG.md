@@ -2589,3 +2589,11 @@
   shared so provider configuration (inline API keys, model catalog) is still
   read. Operator-supplied `XDG_DATA_HOME` keeps precedence per the standard
   env-merge rules; creation failure degrades to shared state with a warning.
+
+### Fixed (buzz-acp, follow-up)
+- Per-WORKER OpenCode data isolation: the previous fix isolated per agent
+  (pubkey), but each agent's pool spawns 10 OpenCode workers that then shared
+  one sqlite store — boot bursts and concurrent turns stalled siblings
+  (ep_poll, tool result in hand, next model call never sent). Every spawn
+  path (pool init + all respawn paths) now gives worker `i` its own
+  `<base>/w<i>` `XDG_DATA_HOME`.

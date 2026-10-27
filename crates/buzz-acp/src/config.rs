@@ -951,6 +951,25 @@ pub fn propagate_legacy_env_vars() {
 }
 
 impl Config {
+    /// Base directory for per-worker OpenCode data isolation
+    /// (`$XDG_DATA_HOME/opencode-agents/<agent-pubkey>`), or `None` when the
+    /// agent command is not OpenCode or no data home can be resolved. The
+    /// pool appends per-worker leaf dirs (`w<i>`) at spawn time; leaf
+    /// creation (and its warnings) lives in
+    /// `runtime::opencode_worker_env`.
+    pub(crate) fn opencode_data_base(&self) -> Option<std::path::PathBuf> {
+        if normalize_agent_command_identity(&self.agent_command) != "opencode" {
+            return None;
+        }
+        let base = std::env::var_os("XDG_DATA_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| std::path::PathBuf::from(home).join(".local/share"))
+            })?;
+        Some(base.join("opencode-agents").join(self.keys.public_key().to_hex()))
+    }
+
     pub fn from_cli() -> Result<Self, ConfigError> {
         // Legacy env-var propagation is intentionally NOT done here.
         // Call `propagate_legacy_env_vars()` before the tokio runtime starts

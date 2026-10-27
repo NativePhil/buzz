@@ -3283,7 +3283,11 @@ async fn run_harness(
                 tracing::info!(agent = idx, "slot refill: spawning background respawn");
                 let cmd = config.agent_command.clone();
                 let args = config.agent_args.clone();
-                let env = config.persona_env_vars.clone();
+                let env = runtime::opencode_worker_env(
+                    config.opencode_data_base().as_deref(),
+                    idx,
+                    config.persona_env_vars.clone(),
+                );
                 let has_codex = config.has_generated_codex_config;
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
@@ -5752,7 +5756,11 @@ fn recover_panicked_agent(
     slot.respawn_in_flight = true;
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
-    let env = config.persona_env_vars.clone();
+    let env = runtime::opencode_worker_env(
+        config.opencode_data_base().as_deref(),
+        i,
+        config.persona_env_vars.clone(),
+    );
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
@@ -5994,7 +6002,11 @@ fn spawn_respawn_task(
     // Spawn the actual work (shutdown + sleep + spawn + init) off the main loop.
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
-    let env = config.persona_env_vars.clone();
+    let env = runtime::opencode_worker_env(
+        config.opencode_data_base().as_deref(),
+        index,
+        config.persona_env_vars.clone(),
+    );
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
@@ -6053,10 +6065,15 @@ async fn initialize_agent_pool(
     // Attempt each spawn under a 60-second timeout; a partial pool is valid.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
+        let spawn_env = runtime::opencode_worker_env(
+            startup.opencode_data_base.as_deref(),
+            i,
+            startup.extra_env.clone(),
+        );
         let spawn_result = AcpClient::spawn(
             &startup.command,
             &startup.args,
-            &startup.extra_env,
+            &spawn_env,
             startup.has_generated_codex_config,
         )
         .await;
