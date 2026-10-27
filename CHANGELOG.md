@@ -2576,3 +2576,16 @@
 ## v0.3.0
 
 - Initial release on the automated pipeline. Unifies OSS and internal version numbering above both v0.0.21 (OSS) and v0.2.38 (internal).
+
+## Native fork — 2026-10-27
+
+### Fixed (buzz-acp)
+- OpenCode managed agents now get a per-agent `XDG_DATA_HOME`
+  (`$XDG_DATA_HOME/opencode-agents/<agent-pubkey>`), isolating each managed
+  agent's session database. Without it, every agent on the host — plus any
+  interactive OpenCode session — contends on a single sqlite store; observed
+  as silent mid-turn stalls (tool result in hand, next model call never sent)
+  and as startup hangs against orphaned daemons. `XDG_CONFIG_HOME` stays
+  shared so provider configuration (inline API keys, model catalog) is still
+  read. Operator-supplied `XDG_DATA_HOME` keeps precedence per the standard
+  env-merge rules; creation failure degrades to shared state with a warning.

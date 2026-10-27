@@ -61,11 +61,62 @@ pub(crate) struct PoolStartup {
 
 impl PoolStartup {
     fn from_config(config: &Config, observer: Option<observer::ObserverHandle>) -> Self {
+        let mut extra_env = config.persona_env_vars.clone();
+        // OpenCode keeps every instance's state (sessions, sqlite db, WAL)
+        // under `$XDG_DATA_HOME/opencode`. Without isolation all managed
+        // agents on the host contend on one sqlite database alongside any
+        // interactive OpenCode session — observed as silent mid-turn stalls
+        // (tool result in hand, next model call never sent) and as startup
+        // hangs against orphaned daemons. Give each managed agent its own
+        // data directory. `XDG_CONFIG_HOME` stays shared so the provider
+        // configuration (inline API keys, model catalog) is still read.
+        // Operator-supplied `XDG_DATA_HOME` (persona env or parent
+        // environment) keeps precedence per the standard merge rules.
+        if crate::config::normalize_agent_command_identity(&config.agent_command) == "opencode" {
+            match std::env::var_os("XDG_DATA_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| {
+                        std::path::PathBuf::from(home).join(".local/share")
+                    })
+                }) {
+                Some(base) => {
+                    let dir =
+                        base.join("opencode-agents").join(config.keys.public_key().to_hex());
+                    match std::fs::create_dir_all(&dir) {
+                        Ok(()) => {
+                            tracing::info!(
+                                dir = %dir.display(),
+                                "opencode data isolation: per-agent XDG_DATA_HOME"
+                            );
+                            extra_env.push((
+                                "XDG_DATA_HOME".to_string(),
+                                dir.to_string_lossy().into_owned(),
+                            ));
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                dir = %dir.display(),
+                                error = %e,
+                                "opencode data isolation: could not create per-agent \
+                                 data dir; agents share the default data home"
+                            );
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        "opencode data isolation: neither XDG_DATA_HOME nor HOME is set; \
+                         agents share the default data home"
+                    );
+                }
+            }
+        }
         Self {
             agents: config.agents,
             command: config.agent_command.clone(),
             args: config.agent_args.clone(),
-            extra_env: config.persona_env_vars.clone(),
+            extra_env,
             has_generated_codex_config: config.has_generated_codex_config,
             model: config.model.clone(),
             effort_level: config.effort_level.clone(),
