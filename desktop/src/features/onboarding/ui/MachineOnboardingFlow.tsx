@@ -24,7 +24,7 @@ import {
 } from "./IdentityKeyHelpDialog";
 import { IdentityKeyIntroduction } from "./IdentityKeyIntroduction";
 import { IdentityRecoveryPairing } from "./IdentityRecoveryPairing";
-import { LandingBees } from "./LandingBees";
+import { LandingVideoBackdrop } from "./LandingVideoBackdrop";
 import {
   NostrKeyImportForm,
   type NostrKeyImportStage,
@@ -332,7 +332,7 @@ export function MachineOnboardingFlow({
         data-testid="machine-onboarding-gate"
       >
         <StartupWindowDragRegion />
-        <LandingBees />
+        <LandingVideoBackdrop />
         <OnboardingFooterProvider>
           <div className="relative my-auto flex w-full max-w-[1040px] flex-col items-center text-center">
             <OnboardingSlideTransition
